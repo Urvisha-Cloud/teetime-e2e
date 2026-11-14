@@ -2,6 +2,7 @@ import type { TestInfo } from "@playwright/test";
 import { BookingApp, type CreatedBooking } from "../support/booking-app";
 import { env } from "../support/env";
 import { fromMinutes, slotRange, toMinutes } from "../support/time";
+import { exerciseExtendControls, extendEndLabel } from "../support/extend-popup";
 import { expect, orBlocked, requireBookingCreation, selectRequestedSlot, test, testUser } from "./fixtures";
 
 /**
@@ -15,7 +16,9 @@ import { expect, orBlocked, requireBookingCreation, selectRequestedSlot, test, t
  *        (group size unchanged) -> Booking Confirmed -> calendar
  *  TC45  update group size: ⋮ -> Update Group Size -> TEETIME_GROUP_SIZE_UPDATE (default 5) -> Add players
  *        -> "Reschedule details" -> Booking Confirmed -> calendar
- *  TC46  extend: ⋮ -> Extend Booking -> TEETIME_EXTEND_BY (default "+30 min") -> Continue -> "Extend details"
+ *  TC46  extend: ⋮ -> Extend Booking -> every way to pick the time, always in sync (label, slider, "Ends …"):
+ *        + / − buttons, each preset, + to the maximum (− / + disabled at the limits; past midnight "Ends Sun 12:30 AM"),
+ *        then the slider dragged to TEETIME_EXTEND_BY (default "+30 min") -> Continue -> "Extend details"
  *        -> Booking Confirmed with the new end time -> calendar
  *  TC47  cancel: ⋮ -> Cancel booking -> Confirm cancellation -> "Booking cancelled" -> calendar slots free again
  *
@@ -24,7 +27,8 @@ import { expect, orBlocked, requireBookingCreation, selectRequestedSlot, test, t
  * same screens on their own bookings.
  */
 test.describe("Booking flow: login -> create -> reschedule -> group size -> extend -> cancel @creates-booking", () => {
-  test.describe.configure({ mode: "serial" });
+  // Each step pauses to be read (TEETIME_READ_MS), so allow more time per step
+  test.describe.configure({ mode: "serial", timeout: 240_000 });
 
   let app: BookingApp;
   let loggedIn = false;
@@ -67,10 +71,10 @@ test.describe("Booking flow: login -> create -> reschedule -> group size -> exte
   async function openManageMenu(b: CreatedBooking) {
     const startCell = app.cell(b.bayId, b.startIdx);
     await startCell.scrollIntoViewIfNeeded();
-    await startCell.getByRole("button").first().click();
+    await app.guidedClick(startCell.getByRole("button").first());
     const menu = dialog("Manage your booking");
     await expect(menu).toBeVisible();
-    return menu;
+    return menu; // the caller moves the arrow to the option and pauses there to read
   }
 
   /**
@@ -86,12 +90,14 @@ test.describe("Booking flow: login -> create -> reschedule -> group size -> exte
   ) {
     const details = dialog(title);
     await expect(details).toBeVisible({ timeout: 30_000 });
+    await app.readPause(); // read the new booking details
     // Select the size only if it isn't already selected (clicking a selected size could unselect it)
     if (pickGroupSize) {
       const selected = /bg-green-600/.test((await app.groupSizeButton(details, b.groupSize).getAttribute("class")) ?? "");
       if (!selected) await app.selectGroupSize(details, b.groupSize);
     }
     if (title === "Reschedule details") await app.verifyGroupSize(details, b.groupSize);
+    await app.scrollThrough(details); // slowly down through the price breakdown to the waiver
     const toPay = await app.amountToPay(details);
     testInfo.annotations.push({ type: "you-pay", description: `${title}: $${toPay.toFixed(2)}` });
     if (toPay > 0) await orBlocked(testInfo, () => app.preparePayment(details));
@@ -101,7 +107,7 @@ test.describe("Booking flow: login -> create -> reschedule -> group size -> exte
       (r) => r.request().method() === "PATCH" && r.url().startsWith(env.apiURL) && r.url().includes(`${apiPath}/${b.bookingId}`),
       { timeout: 60_000 },
     );
-    await details.getByRole("button", { name: /^Confirm/ }).click();
+    await app.guidedClick(details.getByRole("button", { name: /^Confirm/ }), { read: Math.min(1500, env.readMs) }); // arrow on Confirm, then click
     const response = await responsePromise;
     const body = await response.json().catch(() => ({}));
     testInfo.annotations.push({ type: `${apiPath}-response`, description: `HTTP ${response.status()} ${JSON.stringify(body).slice(0, 200)}` });
@@ -114,18 +120,11 @@ test.describe("Booking flow: login -> create -> reschedule -> group size -> exte
 
   /** View My Booking -> calendar on the booking's date -> booking verified there, outlined in green for a moment. */
   async function showOnCalendar(b: CreatedBooking) {
-    await app.page.getByRole("button", { name: "View My Booking" }).click();
+    await app.guidedClick(app.page.getByRole("button", { name: "View My Booking" }));
     await app.waitForBookingUi();
     await app.goToDate(b.date);
     await app.verifyBookingOnCalendar(b); // bay, time and number of persons from the API + calendar cells
-    await app.cell(b.bayId, b.startIdx).scrollIntoViewIfNeeded();
-    for (let s = b.startIdx; s <= b.endIdx; s++) {
-      await app.cell(b.bayId, s).evaluate((el) => {
-        (el as HTMLElement).style.outline = "3px solid #16a34a";
-        (el as HTMLElement).style.outlineOffset = "-3px";
-      });
-    }
-    await app.page.waitForTimeout(env.showMs);
+    await app.highlightBooking(b);
   }
 
   test("TC42: login — new user signs up, or the existing user logs in", async ({}, testInfo) => {
@@ -135,8 +134,8 @@ test.describe("Booking flow: login -> create -> reschedule -> group size -> exte
       testInfo.annotations.push({ type: "login", description: `${what}: ${testUser.email}` });
       console.log(`[teetime-e2e] TC42: ${what}: ${testUser.email}`);
     }
-    await app.open();
-    await app.waitForBookingUi();
+    // Login already ends on the booking calendar: use it as it is (no reload)
+    await app.openIfNeeded();
     await expect(app.page.locator("input#email"), "no login popup: the user is signed in").toBeHidden();
     // An authorised API call works with the saved token (it fails when the user is signed out).
     const ids = await app.myActiveBookingIds();
@@ -147,7 +146,13 @@ test.describe("Booking flow: login -> create -> reschedule -> group size -> exte
   test("TC43: create — book the slot -> Booking Confirmed -> calendar", async ({}, testInfo) => {
     test.skip(!loggedIn, "TC42 login failed");
     requireBookingCreation();
-    const sel = await selectRequestedSlot(app, testInfo);
+    const r0 = slotRange(env.rescheduleStart, env.rescheduleEnd);
+    // Not free on the target date -> check the next days; the bay must also be free for the later reschedule + extend
+    const sel = await selectRequestedSlot(app, testInfo, [], {
+      reuseOpenPage: true,
+      tryNextDays: 7,
+      alsoFree: { startIdx: r0.startIdx, endIdx: r0.endIdx + extraSlots },
+    });
     // Later steps need the same bay free for the new time AND the extension after it (default 9:00–11:30 PM).
     const r = slotRange(env.rescheduleStart, env.rescheduleEnd);
     const bays = await app.baysForRange(r.startIdx, r.endIdx + extraSlots);
@@ -158,10 +163,12 @@ test.describe("Booking flow: login -> create -> reschedule -> group size -> exte
     }
 
     const modal = await app.openBookingModal(sel);
+    await app.readPause(); // read the booking details
     await app.selectGroupSize(modal, GROUP_SIZE);
+    await app.scrollThrough(modal); // slowly down through the price to the waiver
     await app.acceptWaiver(modal);
     await orBlocked(testInfo, () => app.preparePayment(modal));
-    const bookingId = await app.confirmBooking(modal);
+    const bookingId = await app.confirmBooking(modal, { read: Math.min(1500, env.readMs) }); // arrow on Confirm, then click
     booking = { ...sel, bookingId, groupSize: GROUP_SIZE };
     testInfo.annotations.push({ type: "bookingId", description: bookingId });
 
@@ -175,22 +182,23 @@ test.describe("Booking flow: login -> create -> reschedule -> group size -> exte
     test.skip(!booking, "TC43 did not create a booking");
     const before = booking!;
     const menu = await openManageMenu(before);
-    await menu.getByRole("button", { name: /Reschedule/ }).filter({ hasText: "Choose a new time" }).click();
+    await app.guidedClick(menu.getByRole("button", { name: /Reschedule/ }).filter({ hasText: "Choose a new time" }), { read: env.readMs });
 
     const rules = dialog("How to Reschedule");
     await expect(rules).toBeVisible();
-    await rules.getByRole("button", { name: /Start rescheduling/i }).click();
+    await app.guidedClick(rules.getByRole("button", { name: /Start rescheduling/i }), { read: env.readMs }); // read "How to reschedule"
     await expect(rules).toBeHidden();
     await expect(app.cell(before.bayId, before.startIdx).getByTitle("Cancel Reschedule")).toBeVisible();
 
     const { startIdx, endIdx } = slotRange(env.rescheduleStart, env.rescheduleEnd);
     await app.cell(before.bayId, startIdx).scrollIntoViewIfNeeded();
-    await app.cell(before.bayId, startIdx).click({ position: { x: 12, y: 12 } });
-    await app.cell(before.bayId, endIdx).click({ position: { x: 12, y: 12 } });
-    await app.page.getByRole("button", { name: "Reschedule", exact: true }).click();
+    await app.guidedClick(app.cell(before.bayId, startIdx), { position: { x: 12, y: 12 } });
+    await app.guidedClick(app.cell(before.bayId, endIdx), { position: { x: 12, y: 12 } });
+    for (let s = startIdx; s <= endIdx; s++) await expect(app.cell(before.bayId, s)).toHaveClass(/bg-green-400\/50/); // selection shown
+    await app.guidedClick(app.page.getByRole("button", { name: "Reschedule", exact: true }), { read: env.readMs }); // see the new time
     const confirm = dialog("Reschedule Booking");
     await expect(confirm).toBeVisible();
-    await confirm.getByRole("button", { name: "Confirm Changes" }).click();
+    await app.guidedClick(confirm.getByRole("button", { name: "Confirm Changes" }), { read: env.readMs }); // read current vs new time
     await expect(confirm).toBeHidden();
 
     const after: CreatedBooking = {
@@ -212,14 +220,15 @@ test.describe("Booking flow: login -> create -> reschedule -> group size -> exte
     const before = booking!;
     expect(env.groupSizeUpdate, "TEETIME_GROUP_SIZE_UPDATE must be larger than the current group size").toBeGreaterThan(before.groupSize);
     const menu = await openManageMenu(before);
-    await menu.getByRole("button", { name: /Update Group Size/ }).click();
+    await app.guidedClick(menu.getByRole("button", { name: /Update Group Size/ }), { read: env.readMs });
 
     const picker = dialog("Choose Number of Persons");
     await expect(picker).toBeVisible();
     const addPlayers = picker.getByRole("button", { name: /^Add players/ });
     await expect(addPlayers, "disabled until a larger group size is picked").toBeDisabled();
-    await picker.getByRole("button", { name: String(env.groupSizeUpdate), exact: true }).click();
-    await addPlayers.click();
+    await app.guidedClick(picker.getByRole("button", { name: String(env.groupSizeUpdate), exact: true }), { read: Math.min(1500, env.readMs) });
+    await expect(addPlayers, "enabled once a larger size is picked").toBeEnabled();
+    await app.guidedClick(addPlayers, { read: env.readMs }); // see the new group size selected
     await expect(picker).toBeHidden();
 
     const after: CreatedBooking = { ...before, groupSize: env.groupSizeUpdate };
@@ -233,14 +242,16 @@ test.describe("Booking flow: login -> create -> reschedule -> group size -> exte
     test.skip(!resized, "TC45 did not update the group size");
     const before = booking!;
     const menu = await openManageMenu(before);
-    await menu.getByRole("button", { name: /Extend Booking/ }).click();
+    await app.guidedClick(menu.getByRole("button", { name: /Extend Booking/ }), { read: env.readMs });
 
     const extend = dialog("additional time");
     await expect(extend).toBeVisible();
-    await extend.getByRole("button", { name: env.extendBy, exact: true }).click();
+    // Slider, + / − and presets all drive one value; limits; ends with the slider on TEETIME_EXTEND_BY
+    const max = await exerciseExtendControls(app, extend, before, extraSlots);
+    testInfo.annotations.push({ type: "extend-max", description: `${max * 15} min` });
     const newEnd = fromMinutes(toMinutes(before.endTime) + extendMinutes);
-    await expect(extend, `"Ends ${newEnd}" after picking ${env.extendBy}`).toContainText(`Ends ${newEnd}`);
-    await extend.getByRole("button", { name: /Continue/ }).click();
+    await expect(extend, `"Ends ${newEnd}" after picking ${env.extendBy}`).toContainText(`Ends ${extendEndLabel(before, extraSlots)}`);
+    await app.guidedClick(extend.getByRole("button", { name: /Continue/ }), { read: env.readMs }); // read the new end time
     await expect(extend).toBeHidden();
 
     const after: CreatedBooking = { ...before, endIdx: before.endIdx + extraSlots, endTime: newEnd };
@@ -254,7 +265,7 @@ test.describe("Booking flow: login -> create -> reschedule -> group size -> exte
     test.skip(!extended, "TC46 did not extend the booking");
     const b = booking!;
     const menu = await openManageMenu(b);
-    await menu.getByRole("button", { name: "Cancel booking", exact: true }).click();
+    await app.guidedClick(menu.getByRole("button", { name: "Cancel booking", exact: true }), { read: env.readMs });
 
     const cancel = dialog("Confirm Cancellation");
     await expect(cancel).toBeVisible();
@@ -262,7 +273,7 @@ test.describe("Booking flow: login -> create -> reschedule -> group size -> exte
       (r) => r.request().method() === "PATCH" && r.url().startsWith(env.apiURL) && r.url().includes(`/booking/cancel/${b.bookingId}`),
       { timeout: 60_000 },
     );
-    await cancel.getByRole("button", { name: "Confirm Cancellation" }).click();
+    await app.guidedClick(cancel.getByRole("button", { name: "Confirm Cancellation" }), { read: env.readMs }); // read the refund
     const response = await responsePromise;
     const body = await response.json().catch(() => ({}));
     testInfo.annotations.push({ type: "cancel-response", description: `HTTP ${response.status()} ${JSON.stringify(body).slice(0, 200)}` });

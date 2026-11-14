@@ -3,6 +3,8 @@ import * as fs from "fs";
 import * as path from "path";
 import { BlockedError, BookingApp, annotateBlocked, type CreatedBooking, type SelectedBooking } from "../support/booking-app";
 import { bookingCreationBlockedReason, env } from "../support/env";
+import { CURSOR_GLIDE_MS, installCursor } from "../support/cursor";
+import { addDays, isoDate } from "../support/time";
 
 /** How this run's test user got in (signup mode only): "signup" = new user created, "login" = existing user. */
 export const testUser: { email?: string; result?: "login" | "signup" } = {};
@@ -36,6 +38,10 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
         userAgent: projectUse.userAgent,
         deviceScaleFactor: projectUse.deviceScaleFactor,
       });
+      // Visible cursor for every page in this window, before the first page opens (login included)
+      if (env.showCursor) {
+        await context.addInitScript(installCursor, { glideMs: CURSOR_GLIDE_MS, idleMs: env.readMs + 3000 });
+      }
       context.setDefaultTimeout(projectUse.actionTimeout || 15_000);
       context.setDefaultNavigationTimeout(projectUse.navigationTimeout || 45_000);
       const page = await context.newPage();
@@ -175,24 +181,52 @@ export async function orBlocked<T>(testInfo: TestInfo, fn: () => Promise<T>): Pr
 }
 
 /** Steps 1–3: open site, select location, go to the booking date, pick a free bay, select the slot range. */
-export async function selectRequestedSlot(app: BookingApp, testInfo: TestInfo, excludeBayIds: string[] = []): Promise<SelectedBooking> {
+export async function selectRequestedSlot(
+  app: BookingApp,
+  testInfo: TestInfo,
+  excludeBayIds: string[] = [],
+  {
+    reuseOpenPage = false,
+    tryNextDays = 0,
+    alsoFree,
+  }: {
+    reuseOpenPage?: boolean;
+    /** No free bay on the date: click the calendar's next arrow and check up to this many following days. */
+    tryNextDays?: number;
+    /** The chosen bay must also be free for this slot range (see findAvailableBay). */
+    alsoFree?: { startIdx: number; endIdx: number };
+  } = {},
+): Promise<SelectedBooking> {
   return orBlocked(testInfo, async () => {
     await test.step("Open booking site", async () => {
-      await app.open();
+      // reuseOpenPage: stay on the calendar that is already open instead of reloading it
+      if (reuseOpenPage) await app.openIfNeeded();
+      else await app.open();
     });
     await test.step(`Select location "${env.locationName}"`, async () => {
       await app.selectLocation(env.locationName);
       await app.verifyLocationData(env.locationName);
     });
-    const date = app.targetDate();
+    let date = app.targetDate();
     await test.step(`Go to booking date (+${env.daysAhead} day)`, async () => {
       await app.goToDate(date);
     });
     return test.step(`Pick a bay free ${env.slotStart}–${env.slotEnd}`, async () => {
-      const bay = await app.findAvailableBay(date, excludeBayIds);
-      const sel = await app.selectRange(bay, date);
-      await app.verifySelectionHeader(sel);
-      return sel;
+      for (let day = 0; ; day++) {
+        try {
+          const bay = await app.findAvailableBay(date, excludeBayIds, alsoFree);
+          if (day > 0) testInfo.annotations.push({ type: "date", description: `moved ${day} day(s) ahead to ${isoDate(date)}` });
+          const sel = await app.selectRange(bay, date);
+          await app.verifySelectionHeader(sel);
+          return sel;
+        } catch (e) {
+          if (!(e instanceof BlockedError) || day >= tryNextDays) throw e;
+          // Time taken in every bay: next day via the calendar's › button (goToDate stops if the app blocks the date)
+          console.log(`[teetime-e2e] ${env.slotStart}–${env.slotEnd} not free on ${isoDate(date)}; trying the next day`);
+          date = addDays(date, 1);
+          await app.goToDate(date);
+        }
+      }
     });
   });
 }

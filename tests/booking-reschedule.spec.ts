@@ -112,14 +112,7 @@ test.describe("Reschedule a booking and update its group size @creates-booking",
     await app.waitForBookingUi();
     await app.goToDate(booking.date);
     await app.verifyBookingOnCalendar(booking); // bay, time and number of persons from the API + calendar cells
-    await app.cell(booking.bayId, booking.startIdx).scrollIntoViewIfNeeded();
-    for (let s = booking.startIdx; s <= booking.endIdx; s++) {
-      await app.cell(booking.bayId, s).evaluate((el) => {
-        (el as HTMLElement).style.outline = "3px solid #16a34a";
-        (el as HTMLElement).style.outlineOffset = "-3px";
-      });
-    }
-    await app.page.waitForTimeout(env.showMs);
+    await app.highlightBooking(booking);
   }
 
   // ───────────────────────────── reschedule ─────────────────────────────

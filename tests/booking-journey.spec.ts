@@ -82,13 +82,6 @@ test.describe("Booking journey: confirm → confirmation screen → View My Book
     await expect(startCell).not.toHaveText(/AM|PM/);
 
     // Show the booked slots on the calendar before the browser closes: scroll to them and outline them in green.
-    await startCell.scrollIntoViewIfNeeded();
-    for (let s = booking!.startIdx; s <= booking!.endIdx; s++) {
-      await app.cell(booking!.bayId, s).evaluate((el) => {
-        (el as HTMLElement).style.outline = "3px solid #16a34a";
-        (el as HTMLElement).style.outlineOffset = "-3px";
-      });
-    }
-    await app.page.waitForTimeout(env.showMs);
+    await app.highlightBooking(booking!);
   });
 });

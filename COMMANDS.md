@@ -22,13 +22,15 @@ Keep this file in sync with `package.json` and the tests: see `.claude/skills/e2
 
 | Command | What it runs | Real booking |
 |---|---|---|
-| `npm test` | **The booking flow, step by step on ONE booking** (TC42–47): login (new user signs up if none is saved or it was deleted, else the saved user logs in) → create → reschedule (same group size) → update group size → extend → cancel. Chrome closes and the command ends when all steps are done | 1 (TC43, cancelled by TC47) |
+| `npm test` | **The booking flow, step by step on ONE booking** (TC42–47): login (new user signs up if none is saved or it was deleted, else the saved user logs in) → create → reschedule (same group size) → update group size → extend → cancel. The extend step (TC46) uses every extend control on that same booking: + / −, each preset, the maximum, the slider. Then the two quick-shift scenarios (TC48–53). Chrome closes and the command ends when all steps are done | 3 (TC43, TC48, TC51; all cancelled) |
 | `npm run test:all` | Everything (45 tests) | 5 (TC11, TC27, TC35, TC38, TC43) + request only (TC20–24) |
 | `npm run test:headed` | Same as `npm run test:all` | 5 (TC11, TC27, TC35, TC38, TC43) + request only (TC20–24) |
 | `npm run test:readonly` | Everything except `@creates-booking` | No |
 | `npm run test:booking` | Only `@creates-booking`: journey TC11–14, declined cards TC20–24, reschedule + group size TC27–34, cancel TC35–37, extend TC38–41, full flow TC42–47 | 5 (TC11, TC27, TC35, TC38, TC43) + request only |
 | `npm run test:journey` | Booking journey TC11–14: sign up → book → confirmation screen → View My Booking → calendar | 1 (TC11) |
 | `npm run test:flow` | **Full flow on ONE booking, step by step** TC42–47: login → create (8–9 PM, 1 player) → reschedule (9–11 PM, same group size) → update group size (5) → extend (+30 min, to 11:30 PM) → cancel → calendar free | 1 (TC43, cancelled by TC47) |
+| `npm run test:quick-shift` | Quick shift TC48–53, one booking each: ⋮ → **15 min earlier** / **15 min later** → "Reschedule booking" shows Current and New time → Confirm changes → Booking Confirmed with the new time → View My Booking → calendar → My Booking page shows the new time | 2 (TC48, TC51; cancelled afterwards) |
+| `npm run test:extend-controls` | Extend popup controls TC54–57 on one booking: "+" / "−", presets +30 min / +1 hr / +2 hr / +3 hr, slider drag — label, slider and "Ends …" always agree, min 15 min / max 3 hr ("Ends 12:00 AM" past midnight) → +45 min → Continue → Extend details → Booking Confirmed → calendar → My Booking | 1 (TC54; cancelled afterwards) |
 | `npm run test:reschedule` | Reschedule + group size TC27–34: book → ⋮ → Reschedule → new time → Confirm Changes → Reschedule details → Booking Confirmed → calendar, then ⋮ → Update Group Size → Add players → Reschedule details → Booking Confirmed → calendar | 1 (TC27) |
 | `npm run test:cancel` | Cancel TC35–37: book → ⋮ → Manage your booking → Cancel Booking → Confirm Cancellation → calendar shows it gone | 1 (TC35, cancelled by TC36) |
 | `npm run test:extend` | Extend TC38–41: book → ⋮ → Manage your booking → Extend Booking → `TEETIME_EXTEND_BY` (+30 min) → Continue → Extend details (waiver, pay) → Confirm → Booking Confirmed → View My Booking → calendar shows the longer booking | 1 (TC38) |
@@ -38,6 +40,8 @@ Keep this file in sync with `package.json` and the tests: see `.claude/skills/e2
 | `npm run test:no-group-size` | TC25 only | No |
 | `npm run test:one -- "TC21"` | Any one test by its number or a word from its title | Depends on the test |
 | `npm run test:ui` | Visual runner: pick tests in a window and watch them run | Depends on what you run |
+
+**Reading speed (`npm test`):** the flow pauses about 1 s on every modal (manage menu, How to reschedule, the selected time, Reschedule booking, the details with a slow scroll through the price, extend time, group size, cancel refund) so you can follow it. Change it with `TEETIME_READ_MS` in `.env` (e.g. `3000` to read longer; `0` = full speed).
 
 Add options after `--`, e.g. `npm run test:payment -- --debug`. Without npm: `npx playwright test <file> --headed`
 (not `npm playwright …`, which is not a valid command). Leaving out `--headed` in an `npx` command runs it in the
@@ -87,8 +91,18 @@ Run any of these with `npm run test:one -- "<TC>"`.
 | TC43 | `booking-flow.spec.ts` | Flow step 2 — create: book 8–9 PM (1 player; 9:00–11:30 PM must also be free in that bay) → Booking Confirmed → calendar | Yes |
 | TC44 | `booking-flow.spec.ts` | Flow step 3 — reschedule: ⋮ → Manage your booking → Reschedule → Start rescheduling → 9–11 PM → Confirm changes → Reschedule details (group size unchanged) → Booking Confirmed → calendar | (TC43's) |
 | TC45 | `booking-flow.spec.ts` | Flow step 4 — update group size: ⋮ → Update Group Size → 5 → Add players → Reschedule details → Booking Confirmed → calendar | (TC43's) |
-| TC46 | `booking-flow.spec.ts` | Flow step 5 — extend: ⋮ → Extend Booking → +30 min → Continue → Extend details → Booking Confirmed (ends 11:30 PM) → calendar | (TC43's) |
+| TC46 | `booking-flow.spec.ts` | Flow step 5 — extend: ⋮ → Extend Booking → every control on the same booking, label / slider / Ends always in sync: starts +15 min (− disabled) → + to +1 hr → − → each preset that fits → + to the maximum (+ disabled; past midnight "Ends Sun 12:30 AM") → back to +15 min → slider dragged to +30 min → Continue → Extend details → Booking Confirmed (ends 11:30 PM) → calendar | (TC43's) |
 | TC47 | `booking-flow.spec.ts` | Flow step 6 — cancel: ⋮ → Cancel booking → Confirm cancellation → "Booking cancelled" → slots free on the calendar | Cancels TC43's |
+| TC48 | `booking-quick-shift.spec.ts` | 15 min earlier — book 8–9 PM (7:45–8:00 PM must also be free in that bay) | Yes |
+| TC49 | `booking-quick-shift.spec.ts` | ⋮ → 15 min earlier → Reschedule booking: Current 8:00–9:00 PM, New 7:45–8:45 PM → Confirm changes → Booking Confirmed 7:45–8:45 PM | (TC48's) |
+| TC50 | `booking-quick-shift.spec.ts` | View My Booking → calendar at 7:45–8:45 PM (8:45–9:00 freed) → My Booking page shows 07:45 PM | (TC48's) |
+| TC51 | `booking-quick-shift.spec.ts` | 15 min later — book 8–9 PM (9:00–9:15 PM must also be free in that bay) | Yes |
+| TC52 | `booking-quick-shift.spec.ts` | ⋮ → 15 min later → Reschedule booking: Current 8:00–9:00 PM, New 8:15–9:15 PM → Confirm changes → Booking Confirmed 8:15–9:15 PM | (TC51's) |
+| TC53 | `booking-quick-shift.spec.ts` | View My Booking → calendar at 8:15–9:15 PM (8:00–8:15 freed) → My Booking page shows 08:15 PM | (TC51's) |
+| TC54 | `booking-extend-controls.spec.ts` | Book 8–9 PM with the 3 hours after it free in that bay (the popup maximum) | Yes |
+| TC55 | `booking-extend-controls.spec.ts` | Extend popup: starts +15 min (− disabled) → + ×3 = +1 hr → − = +45 min → each preset → +3 hr = max (+ disabled, Ends 12:00 AM) → − to the minimum → drag slider to +45 min; label, slider and Ends always match → Continue | (TC54's) |
+| TC56 | `booking-extend-controls.spec.ts` | Extend details (new range) → waiver → Confirm → PATCH /booking/extend → Booking Confirmed ending 9:45 PM | (TC54's) |
+| TC57 | `booking-extend-controls.spec.ts` | View My Booking → calendar up to 9:45 PM → My Booking page shows 09:45 PM | (TC54's) |
 
 ## Reports and debugging
 

@@ -136,13 +136,6 @@ test.describe("Extend a booking @creates-booking", () => {
     await app.verifyBookingOnCalendar(extended!); // every slot from the start to the new end belongs to the booking
 
     // Show the extended booking before the browser moves on: scroll to it and outline it in green.
-    await app.cell(extended!.bayId, extended!.startIdx).scrollIntoViewIfNeeded();
-    for (let s = extended!.startIdx; s <= extended!.endIdx; s++) {
-      await app.cell(extended!.bayId, s).evaluate((el) => {
-        (el as HTMLElement).style.outline = "3px solid #16a34a";
-        (el as HTMLElement).style.outlineOffset = "-3px";
-      });
-    }
-    await app.page.waitForTimeout(env.showMs);
+    await app.highlightBooking(extended!);
   });
 });

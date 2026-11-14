@@ -62,6 +62,10 @@ export const env = {
   cleanup: str("TEETIME_CLEANUP") === "true",
   /** How long the journey test keeps the confirmation screen and the booked calendar on screen (ms). */
   showMs: Number(str("TEETIME_SHOW_MS", "3000")) || 0,
+  /** Watching a headed run: pause on each modal so it can be read (booking-flow.spec.ts). 0 = no pauses. */
+  readMs: Number(str("TEETIME_READ_MS", "1000")) || 0,
+  /** Draw a visible mouse cursor (arrow + click pulse) in the test browser; Playwright's window shows none. */
+  showCursor: str("TEETIME_SHOW_CURSOR", "true").toLowerCase() !== "false",
 };
 
 export function isNonProductionHost(url: string): boolean {

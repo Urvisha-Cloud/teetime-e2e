@@ -1,5 +1,6 @@
 import { expect, type Locator, type Page, type TestInfo } from "@playwright/test";
 import { env } from "./env";
+import { CURSOR_GLIDE_MS } from "./cursor";
 import { ApiRecorder, GET_BOOKING_RE, LIST_BOOKINGS_RE, unwrap } from "./network";
 import {
   addDays,
@@ -60,6 +61,62 @@ export class BookingApp {
     await this.waitForBookingUi();
   }
 
+  /** Like open(), but keeps the page as it is when the booking calendar is already shown (e.g. right after login). */
+  async openIfNeeded() {
+    if (new URL(this.page.url()).pathname === "/book-now") {
+      await this.waitForBookingUi();
+      // The app fetched its location list and bookings during login, before this recorder listened: load them here
+      if (this.api.locations.length === 0) await this.loadLocations();
+      if (!this.api.lastBookingListUrl) await this.loadBookingList();
+      return;
+    }
+    await this.open();
+  }
+
+  /** Read-only GET on the API with the signed-in user's token (from the authToken cookie). */
+  private async authedGet(url: string): Promise<{ status: number; body: any }> {
+    return this.page.evaluate(async (url) => {
+      const m = document.cookie.match(/(?:^|; )authToken=([^;]+)/);
+      let token = m ? decodeURIComponent(m[1]) : "";
+      try {
+        token = JSON.parse(token);
+      } catch {
+        /* plain string */
+      }
+      const userId = token ? JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))).id ?? "" : "";
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, "x-custom-access-id": userId } });
+      return { status: res.status, body: await res.json().catch(() => null) };
+    }, url);
+  }
+
+  /** GET /location/get-location-with-bays (the same list the app uses). */
+  async loadLocations() {
+    const result = await this.authedGet(`${env.apiURL}/location/get-location-with-bays`);
+    expect(result.status, "GET /location/get-location-with-bays").toBe(200);
+    const list = unwrap<any[]>(result.body);
+    if (Array.isArray(list)) this.api.locations = list;
+  }
+
+  /**
+   * GET /booking/get-every for the location shown in the header, with the same fromDate the calendar uses
+   * on first load (yesterday, UTC midnight) — so the recorder has the bookings the app fetched at login.
+   */
+  async loadBookingList() {
+    if (!(await this.locationButton().isVisible())) return;
+    const loc = this.api.location(await this.currentLocationName());
+    if (!loc) return; // no location yet (first-time user): selectLocation() makes the app fetch it
+    const now = new Date();
+    const fromDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1)).toISOString();
+    const url = `${env.apiURL}/booking/get-every?locationId=${loc.id}&fromDate=${encodeURIComponent(fromDate)}`;
+    const result = await this.authedGet(url);
+    expect(result.status, "GET /booking/get-every").toBe(200);
+    const list = unwrap<any[]>(result.body);
+    if (Array.isArray(list)) {
+      this.api.lastBookingList = list;
+      this.api.lastBookingListUrl = url;
+    }
+  }
+
   /** Booking UI is ready when either the grid or the "Select a Location" popup is shown. Fails on the login popup. */
   async waitForBookingUi() {
     const grid = this.page.locator('[data-slot="0"]').first();
@@ -96,7 +153,7 @@ export class BookingApp {
     const emailInput = page.locator("input#email");
     await expect(emailInput, "login popup").toBeVisible({ timeout: 45_000 });
     await emailInput.fill(details.email);
-    await page.getByRole("button", { name: "Continue", exact: true }).click();
+    await this.guidedClick(page.getByRole("button", { name: "Continue", exact: true }));
 
     // POST /user/check-email decides the next screen: existing user -> code screen straight away;
     // unknown email (never created, or deleted from the DB) -> signup form; blocked account -> blocked screen.
@@ -112,9 +169,9 @@ export class BookingApp {
       await firstName.fill(details.firstName);
       await page.getByPlaceholder("Enter your last name").fill(details.lastName);
       await page.getByPlaceholder("1234567890").fill(details.phone);
-      await page.getByRole("combobox").filter({ hasText: "Select a location" }).click();
-      await page.getByRole("option", { name: details.locationName }).click();
-      await page.getByRole("button", { name: "Continue", exact: true }).click();
+      await this.guidedClick(page.getByRole("combobox").filter({ hasText: "Select a location" }));
+      await this.guidedClick(page.getByRole("option", { name: details.locationName }));
+      await this.guidedClick(page.getByRole("button", { name: "Continue", exact: true }));
     }
 
     // Code entry: 4 inputs with ids 1..4. The popup submits by itself once all 4 digits are entered
@@ -124,7 +181,7 @@ export class BookingApp {
     const autoSubmitted = await codeHeading.waitFor({ state: "hidden", timeout: 10_000 }).then(() => true, () => false);
     if (!autoSubmitted) {
       const verify = page.getByRole("button", { name: "Verify & Login" });
-      if (await verify.isVisible()) await verify.click();
+      if (await verify.isVisible()) await this.guidedClick(verify);
     }
 
     // Logged in: popup closed, auth cookie set, booking calendar (or location picker) visible.
@@ -154,14 +211,14 @@ export class BookingApp {
     const popupHeading = this.page.getByRole("heading", { name: "Select a Location" });
     if (await popupHeading.isVisible()) {
       // First-time user: LocationSelectPopup on /book-now
-      await this.page.locator(`p[title="${name}"]`).click();
+      await this.guidedClick(this.page.locator(`p[title="${name}"]`));
       await this.confirmLocationChange(name);
     } else if ((await this.currentLocationName()) !== name) {
-      await this.locationButton().click();
+      await this.guidedClick(this.locationButton());
       await expect(this.page).toHaveURL(/\/location$/);
       const card = this.page.locator(`p[title="${name}"]`);
       await expect(card, `Location "${name}" must exist on /location`).toBeVisible();
-      await card.click();
+      await this.guidedClick(card);
       await this.confirmLocationChange(name);
       await expect(this.page).toHaveURL(/\/book-now$/);
     }
@@ -173,7 +230,7 @@ export class BookingApp {
     const dialog = this.page.getByRole("dialog").filter({ hasText: "Location Change" });
     await expect(dialog).toBeVisible();
     await expect(dialog).toContainText(name);
-    await dialog.getByRole("button", { name: "Change Location" }).click();
+    await this.guidedClick(dialog.getByRole("button", { name: "Change Location" }));
   }
 
   /** Cross-checks the selected location against the app's own location API payload (timezone + bays). */
@@ -224,7 +281,7 @@ export class BookingApp {
         );
       }
       const before = await this.dateNav().locator("h2").first().innerText();
-      await btn.click();
+      await this.guidedClick(btn);
       await expect(this.dateNav().locator("h2").first()).not.toHaveText(before);
     }
     await expect(this.dateNav().locator("h2").first()).toHaveText(headerLabel(target), { useInnerText: true });
@@ -279,11 +336,21 @@ export class BookingApp {
   /**
    * Step 3 — find a bay whose requested range is free. Throws BlockedError (never substitutes another time).
    */
-  async findAvailableBay(date: LocalDate, excludeBayIds: string[] = []): Promise<BaySlotState> {
+  async findAvailableBay(
+    date: LocalDate,
+    excludeBayIds: string[] = [],
+    alsoFree?: { startIdx: number; endIdx: number },
+  ): Promise<BaySlotState> {
     const { startIdx, endIdx } = slotRange(env.slotStart, env.slotEnd);
     const bays = await this.baysForRange(startIdx, endIdx);
+    // alsoFree: the same bay must also be free for this range (e.g. the later reschedule + extend time)
+    const extra = alsoFree ? await this.baysForRange(alsoFree.startIdx, alsoFree.endIdx) : null;
     const candidate = bays.find(
-      (b) => b.free && !excludeBayIds.includes(b.bayId) && this.serverConflicts(b.bayId, date, env.slotStart, env.slotEnd).length === 0,
+      (b) =>
+        b.free &&
+        !excludeBayIds.includes(b.bayId) &&
+        (!extra || extra.find((x) => x.bayId === b.bayId)?.free) &&
+        this.serverConflicts(b.bayId, date, env.slotStart, env.slotEnd).length === 0,
     );
     if (!candidate) {
       throw new BlockedError(
@@ -292,6 +359,74 @@ export class BookingApp {
       );
     }
     return candidate;
+  }
+
+  /** Shows a booking for env.showMs: scrolls it into view and pauses. Draws nothing over the app's own booking card. */
+  async highlightBooking(b: { bayId: string; startIdx: number; endIdx: number }) {
+    await this.cell(b.bayId, b.startIdx).scrollIntoViewIfNeeded();
+    await this.page.waitForTimeout(env.showMs);
+  }
+
+  /** Pause so the current step can be read while watching (TEETIME_READ_MS; 0 = off). */
+  async readPause(ms = env.readMs) {
+    if (ms > 0) await this.page.waitForTimeout(ms);
+  }
+
+  /**
+   * One step of a watched run, always in this order:
+   *  1. optional reading pause first (the arrow stays at the previous step, so it never looks like a click that hangs)
+   *  2. the arrow glides onto the target (only when the visible cursor is on)
+   *  3. click (or check) the moment it arrives: the action / API request starts at once — nothing waits after it.
+   * The caller then waits for the next screen, so the next step starts only when it is really there.
+   */
+  async guidedClick(
+    target: Locator,
+    { read = 0, position, check = false }: { read?: number; position?: { x: number; y: number }; check?: boolean } = {},
+  ) {
+    if (read > 0) await this.page.waitForTimeout(read);
+    await target.scrollIntoViewIfNeeded();
+    await expect(target).toBeVisible();
+    if (env.showCursor) {
+      const box = await target.boundingBox();
+      if (box) {
+        const x = box.x + (position ? position.x : box.width / 2);
+        const y = box.y + (position ? position.y : box.height / 2);
+        await this.page.mouse.move(x, y);
+        await this.page.waitForTimeout(CURSOR_GLIDE_MS); // click exactly when the arrow lands
+      }
+    }
+    if (check) await target.check({ position });
+    else await target.click({ position });
+  }
+
+  /**
+   * Scrolls a modal slowly from top to bottom with the mouse wheel, the arrow resting over the modal, so its details
+   * and price can be read (off when TEETIME_READ_MS=0).
+   */
+  async scrollThrough(modal: Locator) {
+    if (env.readMs <= 0) return;
+    // Scroll position of the modal's scrolling area, or -1 when it is already at the bottom (or cannot scroll)
+    const position = () =>
+      modal.evaluate((root) => {
+        const scrollers = [root as HTMLElement, ...Array.from(root.querySelectorAll<HTMLElement>("*"))].filter(
+          (el) => el.scrollHeight > el.clientHeight + 4 && /(auto|scroll)/.test(getComputedStyle(el).overflowY),
+        );
+        const box = scrollers.sort((a, b) => b.scrollHeight - a.scrollHeight)[0];
+        return !box || box.scrollTop + box.clientHeight >= box.scrollHeight - 2 ? -1 : box.scrollTop;
+      });
+    const rect = await modal.boundingBox();
+    if (!rect) return;
+    await this.page.mouse.move(rect.x + rect.width / 2, rect.y + rect.height / 2);
+    await this.page.waitForTimeout(CURSOR_GLIDE_MS);
+    // Stops at the bottom, or when the wheel no longer moves it (e.g. the arrow is over a part that does not scroll)
+    let last = await position();
+    for (let stalled = 0, i = 0; last !== -1 && stalled < 3 && i < 60; i++) {
+      await this.page.mouse.wheel(0, 60);
+      await this.page.waitForTimeout(200);
+      const now = await position();
+      stalled = now === last ? stalled + 1 : 0;
+      last = now;
+    }
   }
 
   cell(bayId: string, slotIdx: number): Locator {
@@ -306,8 +441,8 @@ export class BookingApp {
   async selectRange(bay: BaySlotState, date: LocalDate): Promise<SelectedBooking> {
     const { startIdx, endIdx } = slotRange(env.slotStart, env.slotEnd);
     await this.cell(bay.bayId, startIdx).scrollIntoViewIfNeeded();
-    await this.cell(bay.bayId, startIdx).click({ position: { x: 12, y: 12 } });
-    await this.cell(bay.bayId, endIdx).click({ position: { x: 12, y: 12 } });
+    await this.guidedClick(this.cell(bay.bayId, startIdx), { position: { x: 12, y: 12 } });
+    await this.guidedClick(this.cell(bay.bayId, endIdx), { position: { x: 12, y: 12 } });
     for (let s = startIdx; s <= endIdx; s++) {
       await expect(this.cell(bay.bayId, s)).toHaveClass(/bg-green-400\/50/);
     }
@@ -342,7 +477,7 @@ export class BookingApp {
 
   async openBookingModal(sel: SelectedBooking): Promise<Locator> {
     const postsBefore = this.api.createRequests.length;
-    await this.bookNowButton().click();
+    await this.guidedClick(this.bookNowButton());
     const modal = this.modal();
     await expect(modal).toBeVisible();
     await expect(modal.getByRole("heading", { name: "Booking Details" })).toBeVisible();
@@ -370,7 +505,7 @@ export class BookingApp {
   }
 
   async selectGroupSize(modal: Locator, n: number) {
-    await this.groupSizeButton(modal, n).click();
+    await this.guidedClick(this.groupSizeButton(modal, n));
     await this.verifyGroupSize(modal, n);
   }
 
@@ -408,8 +543,7 @@ export class BookingApp {
 
   async acceptWaiver(modal: Locator) {
     const box = this.waiverCheckbox(modal);
-    await box.scrollIntoViewIfNeeded();
-    await box.check();
+    await this.guidedClick(box, { check: true });
     await expect(box).toBeChecked();
     await expect(modal.getByText("You must agree to the waiver before confirming your booking.")).toHaveCount(0);
   }
@@ -442,7 +576,7 @@ export class BookingApp {
    */
   async enterCard(modal: Locator, card: { card: string; exp: string; cvc: string; zip: string }) {
     const savedCard = modal.getByRole("button", { name: "Use Different Card" });
-    if (await savedCard.isVisible()) await savedCard.click();
+    if (await savedCard.isVisible()) await this.guidedClick(savedCard);
     await modal.frameLocator('iframe[title*="card number" i]').locator('input[name="cardnumber"]').pressSequentially(card.card);
     await modal.frameLocator('iframe[title*="expiration" i]').locator('input[name="exp-date"]').pressSequentially(card.exp);
     await modal.frameLocator('iframe[title*="CVC" i]').locator('input[name="cvc"]').pressSequentially(card.cvc);
@@ -456,7 +590,7 @@ export class BookingApp {
    * Step 7 — click Confirm, wait for POST /booking/:locationId/:bayId and the redirect to
    * /book-slot/success?bookingId=…&returnTo=/book-now.
    */
-  async confirmBooking(modal: Locator): Promise<string> {
+  async confirmBooking(modal: Locator, { read = 0 }: { read?: number } = {}): Promise<string> {
     const confirm = this.confirmButton(modal);
     await confirm.scrollIntoViewIfNeeded();
     await expect(confirm).toBeVisible();
@@ -465,7 +599,7 @@ export class BookingApp {
       (r) => r.request().method() === "POST" && r.url().startsWith(env.apiURL) && /\/booking\/[0-9a-f-]{36}\/[0-9a-f-]{36}/i.test(r.url()),
       { timeout: 60_000 },
     );
-    await confirm.click();
+    await this.guidedClick(confirm, { read });
     const response = await responsePromise;
     const body = await response.json().catch(() => ({}));
     expect(response.status(), `create booking HTTP status (body: ${JSON.stringify(body).slice(0, 300)})`).toBeLessThan(400);
@@ -523,7 +657,7 @@ export class BookingApp {
    */
   async viewMyBookingAndVerify(created: CreatedBooking) {
     const returnTo = new URL(this.page.url()).searchParams.get("returnTo") ?? "/";
-    await this.page.getByRole("button", { name: "View My Booking" }).click();
+    await this.guidedClick(this.page.getByRole("button", { name: "View My Booking" }));
     if (returnTo === "/") {
       await expect(this.page).toHaveURL(/\/my-bookings$/);
       return;
