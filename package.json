@@ -1,0 +1,33 @@
+{
+  "name": "teetime-booking-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright E2E tests for the TeeTime staging bay-booking flow (black-box; no app code changes).",
+  "scripts": {
+    "auth": "playwright test --project=setup --headed",
+    "test": "playwright test tests/booking-flow.spec.ts --headed",
+    "test:all": "playwright test --headed",
+    "test:readonly": "playwright test --grep-invert @creates-booking --headed",
+    "test:booking": "playwright test --grep @creates-booking --headed",
+    "test:group-sizes": "playwright test tests/group-sizes.spec.ts --headed",
+    "test:headed": "playwright test --headed",
+    "test:journey": "playwright test tests/booking-journey.spec.ts --headed",
+    "test:flow": "playwright test tests/booking-flow.spec.ts --headed",
+    "test:reschedule": "playwright test tests/booking-reschedule.spec.ts --headed",
+    "test:cancel": "playwright test tests/booking-cancel.spec.ts --headed",
+    "test:extend": "playwright test tests/booking-extend.spec.ts --headed",
+    "test:negative": "playwright test tests/booking-negative.spec.ts tests/payment-negative.spec.ts --headed",
+    "test:payment": "playwright test tests/payment-negative.spec.ts --headed",
+    "test:no-group-size": "playwright test -g \"TC25\" --headed",
+    "test:one": "playwright test --headed -g",
+    "test:ui": "playwright test --ui",
+    "report": "playwright show-report",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "@types/node": "^22.10.0",
+    "dotenv": "^16.4.5",
+    "typescript": "^5.6.3"
+  }
+}
