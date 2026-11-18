@@ -17,7 +17,21 @@ for (const [name, url] of [["TEETIME_BASE_URL", env.baseURL], ["TEETIME_API_URL"
 // Detected from the command line in the main process, then passed on through an environment variable:
 // Playwright's worker processes load this config again with a different command line, but they inherit env.
 if (process.argv.some((a) => a === "--project=setup" || a === "setup")) process.env.TEETIME_AUTH_RUN = "1";
+// One id per run (set in the main process; workers inherit it): a browser restarted after a failed test reuses the
+// login made earlier in the SAME run instead of showing the login popup again (tests/fixtures.ts).
+process.env.TEETIME_RUN_ID ??= String(Date.now());
 const isAuthRun = process.env.TEETIME_AUTH_RUN === "1";
+
+// Which browser runs the tests: by this computer — Windows / Linux: Google Chrome, macOS: Safari (WebKit) — or
+// TEETIME_BROWSER in .env (chrome | safari | both). With --project=… on the command line (npm run test:chrome /
+// test:safari) both are defined, so the one asked for always exists. Decided once in the main process (workers
+// load this file again with another command line, but inherit env).
+if (!process.env.TEETIME_BROWSERS) {
+  const explicit = process.argv.some((a) => a.startsWith("--project"));
+  const choice = (process.env.TEETIME_BROWSER || (process.platform === "darwin" ? "safari" : "chrome")).toLowerCase();
+  process.env.TEETIME_BROWSERS = explicit || choice === "both" ? "chrome,safari" : choice === "safari" ? "safari" : "chrome";
+}
+const browsers = process.env.TEETIME_BROWSERS.split(",");
 
 export default defineConfig({
   globalSetup: isAuthRun ? undefined : "./support/global-setup.ts",
@@ -46,6 +60,7 @@ export default defineConfig({
     actionTimeout: 15_000,
     navigationTimeout: 45_000,
   },
+  // The browser(s) picked above (`browsers`): Google Chrome on Windows / Linux, Safari (WebKit) on macOS.
   // channel "chrome" = the installed Google Chrome app (fresh profile each run), not Playwright's test browser.
   projects: isAuthRun
     ? [
@@ -67,5 +82,15 @@ export default defineConfig({
             storageState: env.storageState,
           },
         },
-      ],
+        {
+          // Safari's engine (WebKit), same desktop window. Needs once: npx playwright install webkit
+          name: "desktop-safari",
+          testIgnore: [/auth\.setup\.ts/],
+          use: {
+            ...devices["Desktop Safari"],
+            viewport: { width: 1440, height: 900 },
+            storageState: env.storageState,
+          },
+        },
+      ].filter((p) => browsers.includes(p.name === "desktop-safari" ? "safari" : "chrome")),
 });

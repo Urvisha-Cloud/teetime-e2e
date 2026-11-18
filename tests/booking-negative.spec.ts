@@ -1,7 +1,8 @@
 import { env } from "../support/env";
 import { blockBookingCreation, failBookingCreation, fakeBookingSuccess, toast } from "../support/guards";
 import { slotRange, todayIn } from "../support/time";
-import { expect, orBlocked, selectRequestedSlot, test } from "./fixtures";
+import { fillBookingModal, orBlocked, selectRequestedSlot } from "./helper";
+import { expect, test } from "./fixtures";
 
 test.describe("Unavailable slots and failures", () => {
   test("TC15: unavailable time slots cannot be selected or booked", async ({ app, page }, testInfo) => {
@@ -36,13 +37,15 @@ test.describe("Unavailable slots and failures", () => {
       testInfo.annotations.push({ type: "info", description: "No other-user booking on the booking date; part (b) not exercised." });
     }
 
-    // (c) The requested range: report explicitly when every bay is taken.
-    const { startIdx: s, endIdx: e } = slotRange(env.slotStart, env.slotEnd);
-    const state = await app.baysForRange(s, e);
-    testInfo.annotations.push({
-      type: "availability",
-      description: `${env.slotStart}–${env.slotEnd}: ${state.map((b) => `${b.bayName}=${b.free ? "free" : "taken"}`).join(", ")}`,
-    });
+    // (c) The booking time in use (if a test picked one): report which bays are free for it.
+    if (env.slotStart) {
+      const { startIdx: s, endIdx: e } = slotRange(env.slotStart, env.slotEnd);
+      const state = await app.baysForRange(s, e);
+      testInfo.annotations.push({
+        type: "availability",
+        description: `${env.slotStart}–${env.slotEnd}: ${state.map((b) => `${b.bayName}=${b.free ? "free" : "taken"}`).join(", ")}`,
+      });
+    }
     expect(app.api.createRequests.length).toBe(0);
   });
 
@@ -54,10 +57,7 @@ test.describe("Unavailable slots and failures", () => {
       // The request is answered by Playwright; nothing reaches staging and no booking is created.
       await failBookingCreation(page, scenario.status, scenario.body);
       const sel = await selectRequestedSlot(app, testInfo);
-      const modal = await app.openBookingModal(sel);
-      await app.selectGroupSize(modal, 1);
-      await app.acceptWaiver(modal);
-      await orBlocked(testInfo, () => app.preparePayment(modal));
+      const modal = await fillBookingModal(app, testInfo, sel); // group size 1, waiver, payment
       await app.confirmButton(modal).click();
 
       await expect(toast(page, scenario.expectText)).toBeVisible();
@@ -81,10 +81,7 @@ test.describe("Unavailable slots and failures", () => {
     const FAKE_BOOKING_ID = "00000000-0000-4000-8000-000000000017";
     const posts = await fakeBookingSuccess(page, FAKE_BOOKING_ID);
     const sel = await selectRequestedSlot(app, testInfo);
-    const modal = await app.openBookingModal(sel);
-    await app.selectGroupSize(modal, 2);
-    await app.acceptWaiver(modal);
-    await orBlocked(testInfo, () => app.preparePayment(modal));
+    const modal = await fillBookingModal(app, testInfo, sel, { groupSize: 2 });
 
     const confirm = app.confirmButton(modal);
     await confirm.scrollIntoViewIfNeeded();

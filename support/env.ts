@@ -15,18 +15,29 @@ export const env = {
   allowBookingCreation: str("TEETIME_ALLOW_BOOKING_CREATION") === "true",
 
   locationName: str("TEETIME_LOCATION_NAME", "Tee Time - Honolulu"),
-  slotStart: str("TEETIME_SLOT_START", "8:00 PM"),
-  slotEnd: str("TEETIME_SLOT_END", "9:00 PM"),
-  /** New time for the reschedule test (same bay, same date); must be free and on a 15-minute boundary. */
-  rescheduleStart: str("TEETIME_RESCHEDULE_START", "9:00 PM"),
-  rescheduleEnd: str("TEETIME_RESCHEDULE_END", "11:00 PM"),
+  /** Length of the test booking, and of the reschedule time (which starts right where the booking ends). */
+  bookingMinutes: 60,
+  rescheduleMinutes: 120,
+  /**
+   * Booking time in use — not configured. selectRequestedSlot (tests/helper.ts) finds the first free time at the
+   * location and fills these in; every later step (reschedule, extend, quick shift) reads them. Empty until then.
+   */
+  slotStart: "",
+  slotEnd: "",
+  rescheduleStart: "",
+  rescheduleEnd: "",
   /** Quick pick pressed in the "Extend Booking" popup: "+30 min", "+1 hr", "+2 hr" or "+3 hr". */
   extendBy: str("TEETIME_EXTEND_BY", "+30 min"),
   /** Group size chosen in "Reschedule details" during the reschedule (TC30). */
   rescheduleGroupSize: Number(str("TEETIME_RESCHEDULE_GROUP_SIZE", "4")) || 4,
   /** New group size for the group-size update test (players can only be added: must be > rescheduleGroupSize, max 5). */
   groupSizeUpdate: Number(str("TEETIME_GROUP_SIZE_UPDATE", "5")) || 5,
-  daysAhead: Number(str("TEETIME_DAYS_AHEAD", "1")),
+  daysAhead: Number(str("TEETIME_DAYS_AHEAD", "0")),
+  /**
+   * A booking found TODAY must start at least this many minutes from now: the app blocks rescheduling within 4 hours
+   * of the start (and the 15-min shift within 5 min), so the later steps would be impossible otherwise.
+   */
+  minLeadMinutes: Number(str("TEETIME_MIN_LEAD_MINUTES", "270")),
   browserTz: str("TEETIME_BROWSER_TZ", "Pacific/Honolulu"),
   groupSizes: str("TEETIME_GROUP_SIZES", "1,2,3,4,5")
     .split(",")

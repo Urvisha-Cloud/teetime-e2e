@@ -1,0 +1,749 @@
+import type { Locator, TestInfo } from "@playwright/test";
+import { BlockedError, BookingApp, annotateBlocked, type CreatedBooking, type SelectedBooking } from "../support/booking-app";
+import { bookingCreationBlockedReason, env } from "../support/env";
+import { addDays, compareDates, fromMinutes, headerLabel, isoDate, nowMinutesIn, pad12, slotRange, todayIn, toMinutes } from "../support/time";
+import { expect, test } from "./fixtures";
+
+type StripeCard = Parameters<BookingApp["enterCard"]>[1];
+type ChangeKind = "reschedule" | "extend";
+
+/** The same booking (same day and bay) at a new time. */
+export function atTime(b: CreatedBooking, startTime: string, endTime: string): CreatedBooking {
+  return { ...b, ...slotRange(startTime, endTime), startTime, endTime };
+}
+
+/** The booking moved by `minutes` (quick shift: −15 / +15). */
+export function shiftedBy(b: CreatedBooking, minutes: number): CreatedBooking {
+  return atTime(b, fromMinutes(toMinutes(b.startTime) + minutes), fromMinutes(toMinutes(b.endTime) + minutes));
+}
+
+/** The booking made longer by `slots` × 15 minutes (extend). */
+export function extendedBy(b: CreatedBooking, slots: number): CreatedBooking {
+  // past midnight the end time is on the next day ("12:15 AM"); endIdx then runs past the day's 96 slots
+  return { ...b, endIdx: b.endIdx + slots, endTime: fromMinutes((toMinutes(b.endTime) + slots * 15) % (24 * 60)) };
+}
+
+// ───────────────────────────── suite setup ─────────────────────────────
+
+export function bookingSuite(onApp: (app: BookingApp) => void, { watch = false, timeout = 240_000 } = {}) {
+  test.describe.configure({ mode: "serial", timeout });
+  let app: BookingApp | undefined;
+  let bookingId: string | undefined;
+  let cancelled = false;
+
+  test.beforeAll(async ({ sharedContext }) => {
+    app = new BookingApp(sharedContext.pages()[0] ?? (await sharedContext.newPage()));
+    app.watch = watch;
+    onApp(app);
+  });
+
+  test.afterEach(async ({}, testInfo) => {
+    if (app && testInfo.status !== testInfo.expectedStatus) {
+      await testInfo.attach("failure.png", { body: await app.page.screenshot({ fullPage: true }), contentType: "image/png" });
+    }
+  });
+
+  test.afterAll(async () => {
+    if (app && bookingId && env.cleanup && !cancelled) {
+      const res = await app.cancelBooking(bookingId);
+      console.log(`[teetime-e2e] cleanup: cancel ${bookingId}: HTTP ${res.status}`);
+    }
+    app?.api.detach(); // the window stays open for the next tests; it is closed once at the end of the run
+  });
+
+  return {
+    track(b: { bookingId: string }) {
+      bookingId = b.bookingId;
+    },
+    markCancelled() {
+      cancelled = true;
+    },
+  };
+}
+
+/** Skip creation tests unless staging + explicit opt-in. */
+export function requireBookingCreation() {
+  const reason = bookingCreationBlockedReason();
+  test.skip(!!reason, reason ?? "");
+}
+
+/** Converts a staging-data problem (no free slot, date not allowed, no saved card) into a reported BLOCKED skip. */
+export async function orBlocked<T>(testInfo: TestInfo, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (e) {
+    if (e instanceof BlockedError) {
+      annotateBlocked(testInfo, e.message);
+      test.skip(true, e.message);
+    }
+    throw e;
+  }
+}
+
+// ───────────────────────────── the time plan ─────────────────────────────
+// No booking time is configured — only lengths: the booking (env.bookingMinutes) and the reschedule time right after
+// it (env.rescheduleMinutes). selectRequestedSlot finds the first start where everything a test needs is free and
+// writes the times into `env`, so every later step (reschedule, extend, quick shift) follows them.
+const SLOTS_PER_DAY = 96;
+const bookingSlots = () => env.bookingMinutes / 15;
+const rescheduleSlots = () => env.rescheduleMinutes / 15;
+
+/** Slots relative to the booking start (0 = its first 15 min; negative = before it). */
+export type RelativeSlots = { from: number; to: number };
+
+/** Puts the booking at slot `start` of the day (and the reschedule time right after it) into `env`. */
+function setPlan(start: number) {
+  const at = (slot: number) => fromMinutes(slot * 15);
+  const end = start + bookingSlots();
+  Object.assign(env, {
+    slotStart: at(start),
+    slotEnd: at(end),
+    rescheduleStart: at(end),
+    rescheduleEnd: at(Math.min(end + rescheduleSlots(), SLOTS_PER_DAY - 1)), // only used when it fits (rescheduleRoom)
+  });
+}
+
+/**
+ * Start slots where the booking, `extra` and (with `rescheduleRoom`) the reschedule time all fit inside one day.
+ * Earliest first, or latest first with `latestFirst` (a booking that ends as late as possible, e.g. to extend it
+ * past midnight).
+ */
+function startSlots(extra?: RelativeSlots, { rescheduleRoom = true, latestFirst = false } = {}): number[] {
+  const lo = Math.min(0, extra?.from ?? 0);
+  const hi = Math.max(bookingSlots() + (rescheduleRoom ? rescheduleSlots() : 0), extra ? extra.to + 1 : 0); // exclusive
+  const starts: number[] = [];
+  // end stays before midnight (the grid and the times are one calendar day)
+  for (let s = 0; s < SLOTS_PER_DAY; s++) if (s + lo >= 0 && s + hi <= SLOTS_PER_DAY - 1) starts.push(s);
+  return latestFirst ? starts.reverse() : starts;
+}
+
+/** Steps 1–3: open site, select location, go to the booking date, pick a free bay, select the slot range. */
+export async function selectRequestedSlot(
+  app: BookingApp,
+  testInfo: TestInfo,
+  excludeBayIds: string[] = [],
+  {
+    reuseOpenPage = false,
+    tryNextDays = 7,
+    alsoFree,
+    todayWindow,
+    rescheduleRoom = true,
+    latestFirst = false,
+  }: {
+    reuseOpenPage?: boolean;
+    /**
+     * No bay free for the requested time on the date: click the calendar's › arrow and check up to this many
+     * following days (default 7, for every test). 0 = only the target date. Stops early if the app blocks the date.
+     */
+    tryNextDays?: number;
+    /** The chosen bay must also be free here, relative to the booking start (slotsAfterRequested, rescheduleSlotsRange …). */
+    alsoFree?: RelativeSlots;
+    /**
+     * Book TODAY with a start between `min` and `max` minutes from now (e.g. inside the 4-hour no-reschedule window).
+     * Replaces TEETIME_MIN_LEAD_MINUTES; use with tryNextDays: 0.
+     */
+    todayWindow?: { min: number; max: number };
+    /** false: no room is kept for the reschedule time after the booking (tests that never reschedule). */
+    rescheduleRoom?: boolean;
+    /** Pick the latest free time of the day instead of the earliest (e.g. to extend past midnight). */
+    latestFirst?: boolean;
+  } = {},
+): Promise<SelectedBooking> {
+  return orBlocked(testInfo, async () => {
+    await test.step("Open booking site", async () => {
+      // reuseOpenPage: stay on the calendar that is already open instead of reloading it
+      if (reuseOpenPage) await app.openIfNeeded();
+      else await app.open();
+    });
+    await test.step(`Select location "${env.locationName}"`, async () => {
+      await app.selectLocation(env.locationName);
+      await app.verifyLocationData(env.locationName);
+    });
+    let date = app.targetDate();
+    await test.step(`Go to booking date (+${env.daysAhead} day)`, async () => {
+      await app.goToDate(date);
+    });
+    const freeBay = (start: number) => {
+      setPlan(start);
+      const extra = alsoFree && { startIdx: start + alsoFree.from, endIdx: start + alsoFree.to };
+      return app.findAvailableBay(date, excludeBayIds, extra).catch((e) => {
+        if (e instanceof BlockedError) return e;
+        throw e;
+      });
+    };
+
+    return test.step("Find the first free time and pick its bay", async () => {
+      for (let day = 0; ; day++) {
+        // The earliest time of the day where a bay is free for the booking and everything the test needs after it
+        let found: Awaited<ReturnType<typeof freeBay>> = new BlockedError(`no start time fits on ${isoDate(date)}`);
+        // Today: only starts at least TEETIME_MIN_LEAD_MINUTES from now (reschedule is blocked within 4 hours of the start)
+        const isToday = compareDates(date, todayIn(app.tz)) === 0;
+        const now = isToday ? nowMinutesIn(app.tz) : 0;
+        const earliest = isToday ? now + (todayWindow ? todayWindow.min : env.minLeadMinutes) : 0;
+        const latest = isToday && todayWindow ? now + todayWindow.max : Infinity;
+        for (const start of startSlots(alsoFree, { rescheduleRoom, latestFirst })) {
+          if (start * 15 < earliest || start * 15 > latest) continue;
+          found = await freeBay(start);
+          if (!(found instanceof BlockedError)) break;
+        }
+        if (!(found instanceof BlockedError)) {
+          const msg =
+            `free time on ${isoDate(date)}: ${env.slotStart}–${env.slotEnd} in ${found.bayName}` +
+            ` (reschedule ${env.rescheduleStart}–${env.rescheduleEnd})`;
+          console.log(`[teetime-e2e] ${msg}`);
+          testInfo.annotations.push({ type: "time", description: msg });
+          if (day > 0) testInfo.annotations.push({ type: "date", description: `moved ${day} day(s) ahead to ${isoDate(date)}` });
+          const sel = await app.selectRange(found, date);
+          await app.verifySelectionHeader(sel);
+          return sel;
+        }
+        Object.assign(env, { slotStart: "", slotEnd: "", rescheduleStart: "", rescheduleEnd: "" });
+        const blocked = found;
+        // 3. nothing free that day: next day via the calendar's › button (goToDate stops if the app blocks the date)
+        if (day >= tryNextDays) throw blocked;
+        console.log(`[teetime-e2e] no free time on ${isoDate(date)} at ${env.locationName}; trying the next day`);
+        date = addDays(date, 1);
+        await app.goToDate(date);
+      }
+    });
+  });
+}
+
+// ───────────────────────────── slots that must also be free ─────────────────────────────
+// For selectRequestedSlot's `alsoFree`: the bay picked for the booking time must be free here too, so the
+// later change (extend, quick shift) is possible in that bay.
+
+/** The `slots` × 15 min right after the booking (extend, 15 min later). */
+export function slotsAfterRequested(slots: number): RelativeSlots {
+  return { from: bookingSlots(), to: bookingSlots() + slots - 1 };
+}
+
+/** The `slots` × 15 min right before the booking (15 min earlier). */
+export function slotsBeforeRequested(slots: number): RelativeSlots {
+  return { from: -slots, to: -1 };
+}
+
+/** The reschedule time (right after the booking), plus `extraSlots` after it (e.g. the later extension). */
+export function rescheduleSlotsRange(extraSlots = 0): RelativeSlots {
+  return { from: bookingSlots(), to: bookingSlots() + rescheduleSlots() + extraSlots - 1 };
+}
+
+// ───────────────────────────── create ─────────────────────────────
+
+/**
+ * Book Now -> "Booking Details": group size, waiver and payment, ready for Confirm (not pressed).
+ * `card`: type this Stripe test card instead of the TEETIME_PAYMENT_MODE payment (negative payment tests).
+ */
+export async function fillBookingModal(
+  app: BookingApp,
+  testInfo: TestInfo,
+  sel: SelectedBooking,
+  { groupSize = 1, card }: { groupSize?: number; card?: StripeCard } = {},
+): Promise<Locator> {
+  const modal = await app.openBookingModal(sel);
+  await app.readPause(); // read the booking details
+  await app.selectGroupSize(modal, groupSize);
+  await app.scrollThrough(modal); // slowly down through the price to the waiver
+  await app.acceptWaiver(modal);
+  await orBlocked(testInfo, () => (card ? app.enterCard(modal, card) : app.preparePayment(modal)));
+  return modal;
+}
+
+/** Fill the Booking Details modal and Confirm: POST /booking/:locationId/:bayId -> Booking Confirmed screen. */
+export async function bookSlot(
+  app: BookingApp,
+  testInfo: TestInfo,
+  sel: SelectedBooking,
+  { groupSize = 1 }: { groupSize?: number } = {},
+): Promise<CreatedBooking> {
+  const modal = await fillBookingModal(app, testInfo, sel, { groupSize });
+  const bookingId = await app.confirmBooking(modal, { read: Math.min(1500, app.readMs) }); // arrow on Confirm, then click
+  testInfo.annotations.push({ type: "bookingId", description: bookingId });
+  return { ...sel, bookingId, groupSize };
+}
+
+/**
+ * Finds a free slot (selectRequestedSlot) and books it. If the booking cannot be created — the slot was taken in the
+ * meantime, the API refused it, the confirmation never came — it cancels whatever that attempt created for the test
+ * user (never anyone else's booking), reloads the calendar for fresh availability and picks again: `attempts` times
+ * at most, then fails with the last error.
+ */
+export async function bookFreeSlot(
+  app: BookingApp,
+  testInfo: TestInfo,
+  options: Parameters<typeof selectRequestedSlot>[3] = {},
+  { groupSize = 1, attempts = 3 }: { groupSize?: number; attempts?: number } = {},
+): Promise<CreatedBooking> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    // Retries reload the page, so the calendar shows the latest availability
+    const sel = await selectRequestedSlot(app, testInfo, [], attempt === 1 ? options : { ...options, reuseOpenPage: false });
+    const before = new Set(await app.myActiveBookingIds());
+    try {
+      return await bookSlot(app, testInfo, sel, { groupSize });
+    } catch (e) {
+      if (testInfo.expectedStatus === "skipped") throw e; // a deliberate skip (e.g. no way to pay), not a failed slot
+      lastError = e;
+      const reason = (e instanceof Error ? e.message : String(e)).split("\n")[0].slice(0, 160);
+      // Only bookings that appeared during this attempt (the test user's own) are cancelled
+      const created = (await app.myActiveBookingIds().catch(() => [] as string[])).filter((id) => !before.has(id));
+      for (const id of created) {
+        const res = await app.cancelBooking(id);
+        console.log(`[teetime-e2e] cleanup after failed attempt: cancel ${id}: HTTP ${res.status}`);
+      }
+      const msg = `booking ${sel.startTime}–${sel.endTime} in ${sel.bayName} on ${isoDate(sel.date)} failed (attempt ${attempt}/${attempts}): ${reason}`;
+      console.log(`[teetime-e2e] ${msg}${attempt < attempts ? "; trying another free slot" : ""}`);
+      testInfo.annotations.push({ type: "retry", description: msg });
+    }
+  }
+  throw new Error(`No booking could be created after ${attempts} attempts. Last error: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+}
+
+/** Booking Confirmed screen for `b` (time range, bay, persons; API cross-check), kept on screen for TEETIME_SHOW_MS. */
+export async function expectConfirmed(app: BookingApp, b: CreatedBooking) {
+  await expect(app.page).toHaveURL(new RegExp(`/book-slot/success\\?bookingId=${b.bookingId}`), { timeout: 30_000 });
+  await app.verifyCheckout(b);
+  await app.page.waitForTimeout(env.showMs);
+}
+
+// ───────────────────────────── "Manage your booking" ─────────────────────────────
+
+type ManageOption = "reschedule" | "group size" | "extend" | "cancel" | "15 min earlier" | "15 min later";
+
+const MANAGE_OPTIONS: Record<ManageOption, (menu: Locator) => Locator> = {
+  reschedule: (menu) => menu.getByRole("button", { name: /Reschedule/ }).filter({ hasText: "Choose a new time" }),
+  "group size": (menu) => menu.getByRole("button", { name: /Update Group Size/ }),
+  extend: (menu) => menu.getByRole("button", { name: /Extend Booking/ }),
+  cancel: (menu) => menu.getByRole("button", { name: "Cancel booking", exact: true }), // red button in the footer
+  "15 min earlier": (menu) => menu.getByRole("button", { name: "15 min earlier", exact: true }),
+  "15 min later": (menu) => menu.getByRole("button", { name: "15 min later", exact: true }),
+};
+
+/** ⋮ on the booking -> "Manage your booking" -> `option` (it must be offered, i.e. enabled). */
+export async function manageBooking(app: BookingApp, b: CreatedBooking, option: ManageOption) {
+  const menu = await app.openManageMenu(b);
+  const button = MANAGE_OPTIONS[option](menu);
+  await expect(button, `"${option}" is offered for this booking`).toBeEnabled();
+  await app.guidedClick(button, { read: app.readMs });
+}
+
+/**
+ * Click `button` and wait for the app's PATCH /booking/<action>/<bookingId>: HTTP < 400, response noted in the report.
+ */
+export async function clickAndExpectPatch(
+  app: BookingApp,
+  testInfo: TestInfo,
+  button: Locator,
+  action: ChangeKind | "cancel",
+  bookingId: string,
+  { read = app.readMs }: { read?: number } = {},
+) {
+  const responsePromise = app.page.waitForResponse(
+    (r) => r.request().method() === "PATCH" && r.url().startsWith(env.apiURL) && r.url().includes(`/booking/${action}/${bookingId}`),
+    { timeout: 60_000 },
+  );
+  await app.guidedClick(button, { read });
+  const response = await responsePromise;
+  const body = await response.json().catch(() => ({}));
+  testInfo.annotations.push({ type: `${action}-response`, description: `HTTP ${response.status()} ${JSON.stringify(body).slice(0, 200)}` });
+  expect(response.status(), `${action} HTTP status (body: ${JSON.stringify(body).slice(0, 300)})`).toBeLessThan(400);
+  return body;
+}
+
+/**
+ * "Reschedule details" (reschedule, group-size update) or "Extend details" (extend) for the changed booking `b`:
+ * group size (reschedule; `pickGroupSize` selects it here when it isn't selected yet), payment only when "You pay"
+ * is above $0.00, waiver -> Confirm -> PATCH /booking/<kind>/:id -> Booking Confirmed for `b`.
+ */
+export async function confirmChangeDetails(
+  app: BookingApp,
+  testInfo: TestInfo,
+  kind: ChangeKind,
+  b: CreatedBooking,
+  { pickGroupSize = false }: { pickGroupSize?: boolean } = {},
+) {
+  const title = kind === "reschedule" ? "Reschedule details" : "Extend details";
+  const details = app.dialog(title);
+  await expect(details).toBeVisible({ timeout: 30_000 });
+  if (kind === "extend") await expect(details, "new time range in the details").toContainText(`${b.startTime} - ${b.endTime}`);
+  await app.readPause(); // read the new booking details
+  if (kind === "reschedule") {
+    // Clicking a size that is already selected could unselect it, so only click when it isn't
+    const selected = /bg-green-600/.test((await app.groupSizeButton(details, b.groupSize).getAttribute("class")) ?? "");
+    if (pickGroupSize && !selected) await app.selectGroupSize(details, b.groupSize);
+    await app.verifyGroupSize(details, b.groupSize);
+  }
+  await app.scrollThrough(details); // slowly down through the price breakdown to the waiver
+  // The saved card ("Use Different Card") is shown even when nothing is due (e.g. "Previously paid" covers the
+  // change), so only "You pay" decides whether a payment is needed.
+  const toPay = await app.amountToPay(details);
+  testInfo.annotations.push({ type: "you-pay", description: `${title}: $${toPay.toFixed(2)}` });
+  if (toPay > 0) await orBlocked(testInfo, () => app.preparePayment(details));
+  await app.acceptWaiver(details); // at the bottom of the scrolling modal
+
+  const confirm = details.getByRole("button", { name: /^Confirm/ });
+  await clickAndExpectPatch(app, testInfo, confirm, kind, b.bookingId, { read: Math.min(1500, app.readMs) });
+  await expectConfirmed(app, b);
+}
+
+// ───────────────────────────── reschedule ─────────────────────────────
+
+/** ⋮ -> Reschedule -> "How to Reschedule" (only once) -> Start rescheduling: the calendar is in reschedule mode. */
+export async function startReschedule(app: BookingApp, b: CreatedBooking) {
+  await manageBooking(app, b, "reschedule");
+  const rules = app.dialog("How to Reschedule");
+  await expect(rules).toBeVisible();
+  await expect(rules).toContainText(/only once/i);
+  await app.guidedClick(rules.getByRole("button", { name: /Start rescheduling/i }), { read: app.readMs });
+  await expect(rules).toBeHidden();
+  // Reschedule mode: the booking now shows its "Cancel Reschedule" button.
+  await expect(app.cell(b.bayId, b.startIdx).getByTitle("Cancel Reschedule")).toBeVisible();
+}
+
+/** "Reschedule Booking" confirmation: the Current and the New time side by side. */
+export async function rescheduleConfirmation(app: BookingApp): Promise<Locator> {
+  const confirm = app.dialog("Reschedule Booking");
+  await expect(confirm).toBeVisible();
+  await expect(confirm).toContainText("Current");
+  await expect(confirm).toContainText("New");
+  return confirm;
+}
+
+/**
+ * Reschedule mode: select startTime–endTime in the same bay -> header "Reschedule" -> "Reschedule Booking"
+ * -> Confirm Changes ("Reschedule details" opens next). Returns the booking at the new time, same group size.
+ */
+export async function chooseNewTime(app: BookingApp, b: CreatedBooking, startTime: string, endTime: string): Promise<CreatedBooking> {
+  const next = atTime(b, startTime, endTime);
+  await app.selectSlots(b.bayId, next.startIdx, next.endIdx);
+  await app.guidedClick(app.page.getByRole("button", { name: "Reschedule", exact: true }), { read: app.readMs }); // see the new time
+  const confirm = await rescheduleConfirmation(app);
+  await app.guidedClick(confirm.getByRole("button", { name: "Confirm Changes" }), { read: app.readMs }); // read current vs new
+  await expect(confirm).toBeHidden();
+  return next;
+}
+
+// ───────────────────────────── group size ─────────────────────────────
+
+/**
+ * ⋮ -> Update Group Size -> "Choose Number of Persons": smaller sizes disabled, "Add players" disabled until a larger
+ * size is picked -> `newSize` -> Add players -> "Reschedule details" opens. Returns the booking with the new size.
+ */
+export async function addPlayers(app: BookingApp, b: CreatedBooking, newSize: number): Promise<CreatedBooking> {
+  expect(newSize, "TEETIME_GROUP_SIZE_UPDATE must be larger than the booked group size (players can only be added)")
+    .toBeGreaterThan(b.groupSize);
+  await manageBooking(app, b, "group size");
+
+  // Identify the popup by its own label: the "Reschedule details" modal that opens next has its own size buttons.
+  const picker = app.dialog("Choose Number of Persons");
+  await expect(picker).toBeVisible();
+  for (let n = 1; n < b.groupSize; n++) {
+    await expect(picker.getByRole("button", { name: String(n), exact: true }), `size ${n} is below the booked size`).toBeDisabled();
+  }
+  const add = picker.getByRole("button", { name: /^Add players/ });
+  await expect(add, "disabled while the current group size is selected").toBeDisabled();
+  await app.guidedClick(picker.getByRole("button", { name: String(newSize), exact: true }), { read: Math.min(1500, app.readMs) });
+  await expect(add, "enabled after picking a larger group size").toBeEnabled();
+  await app.guidedClick(add, { read: app.readMs }); // see the new group size selected
+  await expect(picker).toBeHidden();
+  await expect(app.dialog("Reschedule details"), "booking modal opens after Add players").toBeVisible({ timeout: 30_000 });
+  return { ...b, groupSize: newSize };
+}
+
+// ───────────────────────────── extend ─────────────────────────────
+
+/** ⋮ -> Extend Booking -> the "Extend Booking" popup (one value driven by slider, + / − and presets). */
+export async function openExtendPopup(app: BookingApp, b: CreatedBooking): Promise<Locator> {
+  await manageBooking(app, b, "extend");
+  const popup = app.dialog("additional time");
+  await expect(popup).toBeVisible();
+  await expect(popup.getByRole("heading", { name: "Extend Booking" })).toBeVisible();
+  return popup;
+}
+
+/** The popup shows "Ends <new end>" for `slots` extra -> Continue ("Extend details" opens next). Returns the longer booking. */
+export async function continueExtend(app: BookingApp, popup: Locator, b: CreatedBooking, slots: number): Promise<CreatedBooking> {
+  const ends = extendEndLabel(b, slots);
+  await expect(popup, `"Ends ${ends}" for +${slots * 15} min`).toContainText(`Ends ${ends}`);
+  await app.guidedClick(popup.getByRole("button", { name: /Continue/ }), { read: app.readMs }); // read the new end time
+  await expect(popup).toBeHidden();
+  return extendedBy(b, slots);
+}
+
+// ───────────────────────────── cancel ─────────────────────────────
+
+// ───────────────────────────── refund policy ─────────────────────────────
+// The cancellation refund rules, the same as the backend (getRefundPercentByTime) and the "How refunds work" list in
+// the cancel popup (CancellationPolicyModal). New cancel scenarios reuse these: book a slot, openCancelDialog(),
+// expectRefundShown(), then cancelInUi() or keepBooking().
+
+/** Refund tiers, highest first: from `minMinutes` before the start, `percent` of what was paid comes back. */
+export const REFUND_TIERS = [
+  { minMinutes: 240, percent: 90, title: "90% refund", text: "More than 4 hours before the start time" },
+  { minMinutes: 60, percent: 50, title: "50% refund", text: "Between 1 and 4 hours before the start time" },
+  { minMinutes: 0, percent: 0, title: "No refund", text: "Within 1 hour of the start time" },
+] as const;
+
+/** Refund percent for a cancellation `minutesBeforeStart` before the booking starts. */
+export const refundPercentFor = (minutesBeforeStart: number): number =>
+  (REFUND_TIERS.find((t) => minutesBeforeStart >= t.minMinutes) ?? REFUND_TIERS[REFUND_TIERS.length - 1]).percent;
+
+/** Minutes from now until `b` starts, in the location's time zone. */
+export function minutesUntilStart(app: BookingApp, b: CreatedBooking): number {
+  const days = compareDates(b.date, todayIn(app.tz)) / 86_400_000;
+  return days * 24 * 60 + toMinutes(b.startTime) - nowMinutesIn(app.tz);
+}
+
+/** What the booking was paid with, in total: card + wallet + gift cards + membership credit (paymentBreakdown). */
+export function paidTotal(booking: any): number {
+  const p = booking?.paymentBreakdown;
+  if (!p) return Number(booking?.paidAmount || 0);
+  const gifts = (p.giftCards || []).reduce((sum: number, g: any) => sum + Number(g.amount || 0), 0);
+  return Number(p.cardAmount || 0) + Number(p.walletAmount || 0) + gifts + Number(p.membershipCreditAmount || 0);
+}
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
+
+/** ⋮ -> Cancel booking: the cancel popup (booking, refund, policy), not confirmed yet. */
+export async function openCancelDialog(app: BookingApp, b: CreatedBooking): Promise<Locator> {
+  await manageBooking(app, b, "cancel");
+  const cancel = app.dialog("Confirm Cancellation");
+  await expect(cancel).toBeVisible();
+  await expect(cancel.getByRole("heading", { name: "Cancel Booking" })).toBeVisible();
+  return cancel;
+}
+
+/**
+ * The cancel popup shows the right refund for `b` right now:
+ *  - "How refunds work" opens the three tiers (90% / 50% / no refund) and closes again
+ *  - refund due: "Total refund (X%)" with paid × X%, a Card line when a card paid, the 10% fee note at 90%,
+ *    and "Refunds are processed automatically"
+ *  - nothing due: the "non-refundable" notice and no "Total refund"
+ * Returns the expected percent and amount (also noted in the report).
+ */
+export async function expectRefundShown(app: BookingApp, testInfo: TestInfo, cancel: Locator, b: CreatedBooking) {
+  const minutes = minutesUntilStart(app, b);
+  const percent = refundPercentFor(minutes);
+  const booking = await app.fetchBooking(b.bookingId);
+  const paid = paidTotal(booking);
+  const amount = round2((paid * percent) / 100);
+  testInfo.annotations.push({ type: "refund", description: `${minutes} min before start: ${percent}% of $${paid.toFixed(2)} = $${amount.toFixed(2)}` });
+
+  // The policy list
+  const toggle = cancel.getByRole("button", { name: /How refunds work/ });
+  await app.guidedClick(toggle);
+  for (const tier of REFUND_TIERS) {
+    await expect(cancel.getByText(tier.title, { exact: true }), `policy shows "${tier.title}"`).toBeVisible();
+    await expect(cancel).toContainText(tier.text);
+  }
+  await app.readPause();
+  await app.guidedClick(toggle);
+  await expect(cancel.getByText(REFUND_TIERS[0].title, { exact: true }), "policy list closes again").toBeHidden();
+
+  // The refund for this booking
+  if (amount > 0) {
+    await expect(cancel, "refund total").toContainText(`Total refund (${percent}%)`);
+    await expect(cancel, "refund amount").toContainText(`$${amount.toFixed(2)}`);
+    if (Number(booking?.paymentBreakdown?.cardAmount || 0) > 0) await expect(cancel.getByText("Card", { exact: true }), "card refund line").toBeVisible();
+    if (percent === 90) await expect(cancel).toContainText("Includes a 10% payment processing and digital service fee");
+    await expect(cancel).toContainText("Refunds are processed automatically");
+  } else {
+    await expect(cancel, "non-refundable notice").toContainText("non-refundable");
+    await expect(cancel, "no refund total").not.toContainText("Total refund");
+  }
+  await app.readPause();
+  return { percent, amount, minutes, paid };
+}
+
+/** "Keep booking" in the cancel popup: it closes and the booking stays active. */
+export async function keepBooking(app: BookingApp, cancel: Locator, b: CreatedBooking) {
+  await app.guidedClick(cancel.getByRole("button", { name: "Keep booking", exact: true }), { read: app.readMs });
+  await expect(cancel).toBeHidden();
+  expect(await app.myActiveBookingIds(), "the booking is still active").toContain(b.bookingId);
+}
+
+/**
+ * ⋮ -> Cancel booking -> "Cancel Booking" (refund policy) -> Confirm Cancellation -> PATCH /booking/cancel/:id ->
+ * "Booking cancelled". `checkRefund`: first check the refund shown for this booking (expectRefundShown), then that
+ * the backend applied it. `expectPercent`: the tier the popup must show, checked before Confirm (implies checkRefund).
+ */
+export async function cancelInUi(
+  app: BookingApp,
+  testInfo: TestInfo,
+  b: CreatedBooking,
+  { checkRefund = false, expectPercent }: { checkRefund?: boolean; expectPercent?: number } = {},
+) {
+  const cancel = await openCancelDialog(app, b);
+  const expected = checkRefund || expectPercent !== undefined ? await expectRefundShown(app, testInfo, cancel, b) : null;
+  if (expected && expectPercent !== undefined) {
+    expect(expected.percent, `${expected.minutes} min before the start is the ${expectPercent}% tier`).toBe(expectPercent);
+  }
+  const body = await clickAndExpectPatch(app, testInfo, cancel.getByRole("button", { name: "Confirm Cancellation" }), "cancel", b.bookingId); // read the refund
+  if (expected) {
+    // The refund the backend actually applied follows the policy. The cancel response only carries a message, so the
+    // amounts are read from the cancelled booking (metadata.refundAmount / cancellationFee, saved by the cancel).
+    const after = await app.fetchBooking(b.bookingId);
+    const refunded = Number(after?.metadata?.refundAmount ?? NaN);
+    const fee = Number(after?.metadata?.cancellationFee ?? NaN);
+    const message = String(body?.message ?? "");
+    testInfo.annotations.push({
+      type: "refund-applied",
+      description:
+        `refunded $${refunded.toFixed(2)}, fee $${fee.toFixed(2)} ` +
+        `(expected ${expected.percent}% of $${expected.paid.toFixed(2)} = $${expected.amount.toFixed(2)}); "${message}"`,
+    });
+    expect(refunded, `refund applied: ${expected.percent}% of what was paid`).toBeCloseTo(expected.amount, 2);
+    expect(fee, "cancellation fee = paid − refund").toBeCloseTo(round2(expected.paid - expected.amount), 2);
+    // The API's message names the tier: 90% -> "partial refund (10% fee applied)", 50% -> "(50% fee applied)", 0% -> no refund
+    if (expected.amount > 0) expect(message, "cancel message").toContain(`partial refund (${100 - expected.percent}% fee applied)`);
+    else expect(message, "cancel message").not.toMatch(/refund \(/);
+  }
+
+  await expect(app.page.getByText("Booking cancelled")).toBeVisible();
+  await expect(cancel).toBeHidden();
+}
+
+/** The cancelled booking is gone: no longer active for the user, and its slots on the calendar are free again. */
+export async function expectBookingGone(app: BookingApp, b: CreatedBooking) {
+  await app.goToDate(b.date);
+  await expect
+    .poll(async () => (await app.myActiveBookingIds()).includes(b.bookingId), {
+      message: "cancelled booking still listed as active",
+      timeout: 20_000,
+    })
+    .toBe(false);
+  await app.expectNotOwnBooking(b.bayId, b.startIdx, b.endIdx);
+  const bays = await app.baysForRange(b.startIdx, b.endIdx);
+  expect(bays.find((x) => x.bayId === b.bayId)?.free, `${b.bayName} is free again`).toBe(true);
+  await app.page.waitForTimeout(env.showMs);
+}
+
+
+// ───────────────────────────── extend popup controls ─────────────────────────────
+// The "Extend booking" popup (ExtendBookingModal DurationPicker): one shared value in 15-min slots drives the
+// slider, the + / − buttons, the presets, the "+45 min" label and "Ends …".
+
+/** "45 min", "1 hr", "1 hr 15 min" — the app's formatMinutes(). */
+export const formatMinutes = (minutes: number) => {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (!h) return `${m} min`;
+  return m ? `${h} hr ${m} min` : `${h} hr`;
+};
+
+/** A quick pick of the popup ("+30 min", "+1 hr", … e.g. TEETIME_EXTEND_BY) in 15-minute slots: "+30 min" -> 2. */
+export function presetSlots(label: string): number {
+  const m = label.trim().match(/^\+(\d+)\s*(min|hr)$/i);
+  const minutes = m ? Number(m[1]) * (m[2].toLowerCase() === "hr" ? 60 : 1) : NaN;
+  if (!(minutes > 0 && minutes % 15 === 0)) {
+    throw new Error(`TEETIME_EXTEND_BY="${label}" must be one of "+30 min", "+1 hr", "+2 hr", "+3 hr"`);
+  }
+  return minutes / 15;
+}
+
+/**
+ * The popup's "Ends …" label for `base` + `slots`: "11:30 PM" on the same day, with the weekday once it passes
+ * midnight ("Sun 12:30 AM") — the app's formatEnd(): "h:mm A" or "ddd h:mm A".
+ */
+export function extendEndLabel(base: CreatedBooking, slots: number): string {
+  const total = toMinutes(base.endTime) + slots * 15;
+  const time = fromMinutes(total % (24 * 60));
+  if (total < 24 * 60) return time;
+  const weekday = headerLabel(addDays(base.date, 1)).split(" ")[2]; // "Nov 15 Sun" -> "Sun"
+  return `${weekday} ${time}`;
+}
+
+const slider = (popup: Locator) => popup.getByRole("slider", { name: "Additional time" });
+
+/** The label, the slider position and "Ends …" all show `slots`; the original end time is still shown. */
+async function expectExtendSelection(popup: Locator, base: CreatedBooking, slots: number) {
+  await expect(popup.locator("div.text-2xl"), "additional time label").toHaveText(`+${formatMinutes(slots * 15)}`);
+  await expect.poll(async () => Math.round(Number(await slider(popup).inputValue())), { message: "slider position" }).toBe(slots);
+  await expect(popup, "new end time").toContainText(`Ends ${extendEndLabel(base, slots)}`);
+  await expect(popup, "original end time shown (struck through)").toContainText(base.endTime);
+}
+
+/** Drag the slider with the mouse to `slots`, then fine-tune with the arrow keys if the drag landed a step off. */
+async function dragExtendSlider(app: BookingApp, popup: Locator, slots: number, max: number) {
+  const range = slider(popup);
+  const box = await range.boundingBox();
+  if (!box) throw new Error("extend slider not visible");
+  const xFor = (value: number) => box.x + 8 + (box.width - 16) * (max > 1 ? (value - 1) / (max - 1) : 0);
+  const y = box.y + box.height / 2;
+  const current = Math.round(Number(await range.inputValue()));
+  await app.page.mouse.move(xFor(current), y);
+  await app.page.mouse.down();
+  await app.page.mouse.move(xFor(slots), y, { steps: 12 }); // the label follows while dragging
+  await app.page.mouse.up();
+  for (let i = 0; i < 4; i++) {
+    const now = Math.round(Number(await range.inputValue()));
+    if (now === slots) break;
+    await range.press(now < slots ? "ArrowRight" : "ArrowLeft");
+  }
+}
+
+/**
+ * Uses every way to pick the extra time and checks they always agree, then leaves `finalSlots` selected by
+ * dragging the slider. Adapts to the maximum the popup offers (free time after the booking, up to 3 hr).
+ *  start at +15 min ("−" disabled) · "+" up to +1 hr · "−" one step · every preset that fits · "+" to the maximum
+ *  ("+" disabled; past midnight the end shows the weekday) · back to the minimum · slider drag to `finalSlots`
+ * Returns the maximum in slots.
+ */
+export async function exerciseExtendControls(app: BookingApp, popup: Locator, base: CreatedBooking, finalSlots: number) {
+  const plus = popup.getByRole("button", { name: "Add 15 minutes" });
+  const minus = popup.getByRole("button", { name: "Remove 15 minutes" });
+  const max = Number(await slider(popup).getAttribute("max"));
+  expect(max, `the popup must offer at least ${formatMinutes(finalSlots * 15)}`).toBeGreaterThanOrEqual(finalSlots);
+  await expect(popup, "slider's right end shows the maximum").toContainText(formatMinutes(max * 15));
+
+  // Starts at the minimum
+  await expectExtendSelection(popup, base, 1);
+  await expect(minus, "− disabled at the minimum").toBeDisabled();
+  await app.readPause();
+
+  // "+" up to +1 hr (or the maximum), then "−" one step
+  const up = Math.min(4, max);
+  for (let i = 1; i < up; i++) await app.guidedClick(plus);
+  await expectExtendSelection(popup, base, up);
+  await app.readPause();
+  if (up > 1) {
+    await app.guidedClick(minus);
+    await expectExtendSelection(popup, base, up - 1);
+    await app.readPause();
+  }
+
+  // Every preset that fits: slider, label and end time move together
+  let selected = up > 1 ? up - 1 : 1;
+  for (const [label, slots] of [["+30 min", 2], ["+1 hr", 4], ["+2 hr", 8], ["+3 hr", 12]] as const) {
+    if (slots > max) continue;
+    await app.guidedClick(popup.getByRole("button", { name: label, exact: true }));
+    await expectExtendSelection(popup, base, slots);
+    selected = slots;
+    await app.readPause();
+  }
+
+  // "+" to the maximum, where it is disabled
+  while (selected < max) {
+    await app.guidedClick(plus);
+    selected++;
+  }
+  await expectExtendSelection(popup, base, max);
+  await expect(plus, "+ disabled at the maximum").toBeDisabled();
+  await app.readPause();
+
+  // Back to the minimum (never below 15 min)
+  if (max >= 2) {
+    await app.guidedClick(popup.getByRole("button", { name: "+30 min", exact: true }));
+    await expectExtendSelection(popup, base, 2);
+    await app.guidedClick(minus);
+  }
+  await expectExtendSelection(popup, base, 1);
+  await expect(minus, "− disabled at the minimum").toBeDisabled();
+  await app.readPause();
+
+  // Manual slider drag to the final choice
+  await dragExtendSlider(app, popup, finalSlots, max);
+  await expectExtendSelection(popup, base, finalSlots);
+  await app.readPause();
+  return max;
+}

@@ -1,11 +1,12 @@
 import { expect, type Locator, type Page, type TestInfo } from "@playwright/test";
 import { env } from "./env";
 import { CURSOR_GLIDE_MS } from "./cursor";
-import { ApiRecorder, GET_BOOKING_RE, LIST_BOOKINGS_RE, unwrap } from "./network";
+import { ApiRecorder, unwrap } from "./network";
 import {
   addDays,
   checkoutDateLabel,
   compareDates,
+  fromMinutes,
   headerLabel,
   isoDate,
   modalDateLabel,
@@ -49,16 +50,56 @@ export class BlockedError extends Error {}
 export class BookingApp {
   readonly api: ApiRecorder;
   readonly tz = env.browserTz;
+  /**
+   * Watched run: pause on each modal for TEETIME_READ_MS and scroll slowly through the price (see readMs).
+   * Set by bookingSuite({ watch: true }) in tests/fixtures.ts; off for every other test.
+   */
+  watch = false;
 
   constructor(readonly page: Page) {
     this.api = new ApiRecorder(page);
   }
 
+  /** Reading pause for this run: TEETIME_READ_MS when watching, else 0 (no pauses). */
+  get readMs(): number {
+    return this.watch ? env.readMs : 0;
+  }
+
+  /** A dialog identified by text it contains (its title or a label). */
+  dialog(name: string | RegExp): Locator {
+    return this.page.getByRole("dialog").filter({ hasText: name });
+  }
+
   // ───────────────────────────── navigation / auth ─────────────────────────────
 
   async open() {
+    const since = Date.now();
     await this.page.goto("/book-now");
+    await this.stayOnBookNow(since);
     await this.waitForBookingUi();
+  }
+
+  /**
+   * Older booking-ui builds open My Booking on load when the user has a booking later today (removed from
+   * LocationContext since), so after a login or a reload they can land on /my-bookings. The tests work on the Book Now calendar: wait
+   * until the app has made that decision (its GET /booking/getMyBookings?every=true after `since`) and, if it
+   * switched, go back with the sidebar's "Book Your Bay" — inside the app, because a reload would only switch again.
+   */
+  async stayOnBookNow(since: number) {
+    const loginShown = this.page.locator("input#email");
+    await expect
+      .poll(
+        async () =>
+          this.api.myBookingsLoadedAt >= since || (await loginShown.isVisible()) || new URL(this.page.url()).pathname === "/my-bookings",
+        { timeout: 3_000 }, // short: booking-ui without that switch (removed there) never sends this request
+      )
+      .toBe(true)
+      .catch(() => {}); // not seen in time: carry on, the URL check below still applies
+    await this.page.waitForTimeout(300); // the switch happens right after that response
+    if (new URL(this.page.url()).pathname !== "/my-bookings") return;
+    console.log("[teetime-e2e] the app opened My Booking (a booking later today); back to Book Now");
+    await this.guidedClick(this.page.getByText("Book Your Bay", { exact: true }).first());
+    await expect(this.page).toHaveURL(/\/book-now/);
   }
 
   /** Like open(), but keeps the page as it is when the booking calendar is already shown (e.g. right after login). */
@@ -73,25 +114,43 @@ export class BookingApp {
     await this.open();
   }
 
-  /** Read-only GET on the API with the signed-in user's token (from the authToken cookie). */
-  private async authedGet(url: string): Promise<{ status: number; body: any }> {
-    return this.page.evaluate(async (url) => {
-      const m = document.cookie.match(/(?:^|; )authToken=([^;]+)/);
-      let token = m ? decodeURIComponent(m[1]) : "";
-      try {
-        token = JSON.parse(token);
-      } catch {
-        /* plain string */
-      }
-      const userId = token ? JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))).id ?? "" : "";
-      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, "x-custom-access-id": userId } });
-      return { status: res.status, body: await res.json().catch(() => null) };
-    }, url);
+  /**
+   * fetch() inside the page with the signed-in user's session, the way the app's axios interceptor sends it:
+   * `Authorization: Bearer <authToken cookie>` plus `x-custom-access-id` = the user id in the JWT (the API's auth
+   * middleware requires both). Runs in the page, so the token is never logged or written anywhere.
+   */
+  private async authedFetch(
+    url: string,
+    { method = "GET", body }: { method?: string; body?: unknown } = {},
+  ): Promise<{ ok: boolean; status: number; body: any }> {
+    if (!this.page.url().startsWith(env.baseURL)) await this.page.goto("/book-now");
+    return this.page.evaluate(
+      async ({ url, method, body }) => {
+        const m = document.cookie.match(/(?:^|; )authToken=([^;]+)/);
+        let token = m ? decodeURIComponent(m[1]) : localStorage.getItem("authToken") ?? "";
+        try {
+          token = JSON.parse(token);
+        } catch {
+          /* plain string */
+        }
+        let userId = "";
+        try {
+          userId = JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))).id ?? "";
+        } catch {
+          /* leave empty; the API answers 401 and the caller's status check shows it */
+        }
+        const headers: Record<string, string> = { Authorization: `Bearer ${token}`, "x-custom-access-id": userId };
+        if (body !== undefined) headers["Content-Type"] = "application/json";
+        const res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+        return { ok: res.ok, status: res.status, body: await res.json().catch(() => null) };
+      },
+      { url, method, body },
+    );
   }
 
   /** GET /location/get-location-with-bays (the same list the app uses). */
   async loadLocations() {
-    const result = await this.authedGet(`${env.apiURL}/location/get-location-with-bays`);
+    const result = await this.authedFetch(`${env.apiURL}/location/get-location-with-bays`);
     expect(result.status, "GET /location/get-location-with-bays").toBe(200);
     const list = unwrap<any[]>(result.body);
     if (Array.isArray(list)) this.api.locations = list;
@@ -108,7 +167,7 @@ export class BookingApp {
     const now = new Date();
     const fromDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1)).toISOString();
     const url = `${env.apiURL}/booking/get-every?locationId=${loc.id}&fromDate=${encodeURIComponent(fromDate)}`;
-    const result = await this.authedGet(url);
+    const result = await this.authedFetch(url);
     expect(result.status, "GET /booking/get-every").toBe(200);
     const list = unwrap<any[]>(result.body);
     if (Array.isArray(list)) {
@@ -174,6 +233,7 @@ export class BookingApp {
       await this.guidedClick(page.getByRole("button", { name: "Continue", exact: true }));
     }
 
+    const since = Date.now(); // the app loads the user's bookings after the code is accepted
     // Code entry: 4 inputs with ids 1..4. The popup submits by itself once all 4 digits are entered
     // (LoginPopup.tsx useEffect -> onLogin), so "Verify & Login" is only clicked if the code screen is still up.
     await expect(codeHeading).toBeVisible({ timeout: 30_000 });
@@ -189,6 +249,7 @@ export class BookingApp {
     await expect
       .poll(async () => (await page.context().cookies()).some((c) => c.name === "authToken"), { message: "authToken cookie after login" })
       .toBe(true);
+    await this.stayOnBookNow(since); // the app may open My Booking right after login
     await this.waitForBookingUi();
     return result;
   }
@@ -353,9 +414,15 @@ export class BookingApp {
         this.serverConflicts(b.bayId, date, env.slotStart, env.slotEnd).length === 0,
     );
     if (!candidate) {
+      const state = (b: BaySlotState) => {
+        const also = extra?.find((x) => x.bayId === b.bayId)?.free;
+        return `${b.bayName}:${b.free ? "free" : "taken"}${extra ? `/${also ? "free" : "taken"}` : ""}`;
+      };
+      const time = (idx: number) => (idx >= 96 ? "12:00 AM" : fromMinutes(idx * 15));
+      const alsoText = alsoFree ? ` together with ${time(alsoFree.startIdx)}–${time(alsoFree.endIdx + 1)}` : "";
       throw new BlockedError(
-        `BLOCKED: ${env.slotStart}–${env.slotEnd} on ${isoDate(date)} is unavailable in every bay at ${env.locationName} ` +
-          `(${bays.map((b) => `${b.bayName}:${b.free ? "free" : "taken"}`).join(", ")}).`,
+        `BLOCKED: ${env.slotStart}–${env.slotEnd}${alsoText} on ${isoDate(date)} is unavailable in every bay at ` +
+          `${env.locationName} (${bays.map(state).join(", ")}).`,
       );
     }
     return candidate;
@@ -367,8 +434,8 @@ export class BookingApp {
     await this.page.waitForTimeout(env.showMs);
   }
 
-  /** Pause so the current step can be read while watching (TEETIME_READ_MS; 0 = off). */
-  async readPause(ms = env.readMs) {
+  /** Pause so the current step can be read while watching (TEETIME_READ_MS; nothing when not watching or 0). */
+  async readPause(ms = this.readMs) {
     if (ms > 0) await this.page.waitForTimeout(ms);
   }
 
@@ -401,10 +468,10 @@ export class BookingApp {
 
   /**
    * Scrolls a modal slowly from top to bottom with the mouse wheel, the arrow resting over the modal, so its details
-   * and price can be read (off when TEETIME_READ_MS=0).
+   * and price can be read (only when watching, and off when TEETIME_READ_MS=0).
    */
   async scrollThrough(modal: Locator) {
-    if (env.readMs <= 0) return;
+    if (this.readMs <= 0) return;
     // Scroll position of the modal's scrolling area, or -1 when it is already at the bottom (or cannot scroll)
     const position = () =>
       modal.evaluate((root) => {
@@ -437,15 +504,24 @@ export class BookingApp {
     return this.page.getByRole("button", { name: /Book Now/ });
   }
 
-  /** Click the first slot, then the last slot (CalenderGrid.handleSlotClick extends the range). */
+  /**
+   * Select slots startIdx..endIdx in one bay column: click the first slot, then the last one
+   * (CalenderGrid.handleSlotClick extends the range), and check the whole range shows as selected.
+   * Used for a new booking (selectRange) and for the new time while rescheduling.
+   */
+  async selectSlots(bayId: string, startIdx: number, endIdx: number) {
+    await this.cell(bayId, startIdx).scrollIntoViewIfNeeded();
+    await this.guidedClick(this.cell(bayId, startIdx), { position: { x: 12, y: 12 } });
+    await this.guidedClick(this.cell(bayId, endIdx), { position: { x: 12, y: 12 } });
+    for (let s = startIdx; s <= endIdx; s++) {
+      await expect(this.cell(bayId, s)).toHaveClass(/bg-green-400\/50/);
+    }
+  }
+
+  /** Select the booking time in use (env.slotStart–slotEnd, found by selectRequestedSlot) in `bay`. */
   async selectRange(bay: BaySlotState, date: LocalDate): Promise<SelectedBooking> {
     const { startIdx, endIdx } = slotRange(env.slotStart, env.slotEnd);
-    await this.cell(bay.bayId, startIdx).scrollIntoViewIfNeeded();
-    await this.guidedClick(this.cell(bay.bayId, startIdx), { position: { x: 12, y: 12 } });
-    await this.guidedClick(this.cell(bay.bayId, endIdx), { position: { x: 12, y: 12 } });
-    for (let s = startIdx; s <= endIdx; s++) {
-      await expect(this.cell(bay.bayId, s)).toHaveClass(/bg-green-400\/50/);
-    }
+    await this.selectSlots(bay.bayId, startIdx, endIdx);
     return {
       locationName: env.locationName,
       bayId: bay.bayId,
@@ -618,12 +694,12 @@ export class BookingApp {
    */
   async verifyCheckout(created: CreatedBooking) {
     const page = this.page;
-    // Persistence: the screen itself fetches GET /booking/:id from the backend.
-    const fetched = await page
-      .waitForResponse((r) => r.request().method() === "GET" && GET_BOOKING_RE.test(r.url()) && r.url().includes(created.bookingId), {
-        timeout: 30_000,
-      })
-      .catch(() => null);
+    // Persistence: the screen itself fetches GET /booking/:id from the backend. The recorder keeps that response, so
+    // this returns at once when the screen loaded it before we got here (it used to wait 30s for a request already gone).
+    const fetched = await expect
+      .poll(() => this.api.bookingById.has(created.bookingId), { timeout: 30_000 })
+      .toBe(true)
+      .then(() => this.api.bookingById.get(created.bookingId)!, () => null);
 
     await expect(page.getByRole("heading", { name: "Booking Confirmed" })).toBeVisible();
     await expect(page.getByText("Booking confirmation email sent to")).toBeVisible();
@@ -639,8 +715,8 @@ export class BookingApp {
     await expect(view).toBeEnabled();
 
     if (fetched) {
-      expect(fetched.status()).toBeLessThan(400);
-      const booking = unwrap<any>(await fetched.json());
+      expect(fetched.status).toBeLessThan(400);
+      const booking = unwrap<any>(fetched.body);
       expect(booking?.id ?? created.bookingId).toBe(created.bookingId);
       if (booking?.numberOfPersons != null) expect(Number(booking.numberOfPersons)).toBe(created.groupSize);
       if (booking?.bayId) expect(booking.bayId).toBe(created.bayId);
@@ -651,22 +727,37 @@ export class BookingApp {
   }
 
   /**
-   * Step 9 — "View My Booking" calls navigate(returnTo). returnTo is the pathname where the booking was made
-   * (/book-now), so the app returns to the bay calendar. The calendar's date state is not carried over, so we
-   * move to the booking date with the real arrows and verify the booking cell.
+   * Step 9 — "View My Booking" on the Booking Confirmed screen returns to the bay calendar. The calendar's date
+   * state is not carried over, so we move to the booking date with the real arrows, verify the booking there
+   * (API list + outlined cells) and, unless `highlight` is false, keep it on screen for TEETIME_SHOW_MS.
+   * Used after create, reschedule, group-size update, extend and quick shift.
    */
-  async viewMyBookingAndVerify(created: CreatedBooking) {
-    const returnTo = new URL(this.page.url()).searchParams.get("returnTo") ?? "/";
+  async viewMyBooking(b: CreatedBooking, { highlight = true }: { highlight?: boolean } = {}) {
     await this.guidedClick(this.page.getByRole("button", { name: "View My Booking" }));
-    if (returnTo === "/") {
-      await expect(this.page).toHaveURL(/\/my-bookings$/);
-      return;
-    }
-    await expect(this.page).toHaveURL(new RegExp(`${returnTo.replace(/\//g, "\\/")}$`));
     await this.waitForBookingUi();
-    await expect(this.locationButton()).toContainText(created.locationName);
-    await this.goToDate(created.date);
-    await this.verifyBookingOnCalendar(created);
+    await this.goToDate(b.date);
+    await this.verifyBookingOnCalendar(b);
+    if (highlight) await this.highlightBooking(b);
+  }
+
+  /** The booking's ⋮ (more) button on the calendar -> the "Manage your booking" modal. */
+  async openManageMenu(b: { bayId: string; startIdx: number }): Promise<Locator> {
+    await this.guidedClick(this.cell(b.bayId, b.startIdx).getByRole("button").first());
+    const menu = this.dialog("Manage your booking");
+    await expect(menu).toBeVisible();
+    return menu;
+  }
+
+  /**
+   * Slots startIdx..endIdx of a bay no longer belong to the user's booking (moved, or cancelled). Slots inside
+   * `keep` (the booking's new range, when it overlaps the old one) are skipped.
+   */
+  async expectNotOwnBooking(bayId: string, startIdx: number, endIdx: number, keep?: { startIdx: number; endIdx: number }) {
+    await this.cell(bayId, startIdx).scrollIntoViewIfNeeded();
+    for (let s = startIdx; s <= endIdx; s++) {
+      if (keep && s >= keep.startIdx && s <= keep.endIdx) continue;
+      await expect(this.cell(bayId, s)).not.toHaveClass(/before:border-green-600/);
+    }
   }
 
   async verifyBookingOnCalendar(created: CreatedBooking) {
@@ -688,6 +779,13 @@ export class BookingApp {
     }
   }
 
+  /** GET /booking/:id with the user's session: the booking as the API has it (times, paymentBreakdown, …). */
+  async fetchBooking(bookingId: string): Promise<any> {
+    const { status, body } = await this.authedFetch(`${env.apiURL}/booking/${bookingId}`);
+    expect(status, `GET /booking/${bookingId}`).toBe(200);
+    return unwrap<any>(body);
+  }
+
   // ───────────────────────────── cleanup ─────────────────────────────
 
   /**
@@ -696,38 +794,11 @@ export class BookingApp {
    * app's session is used; the token is never logged or written anywhere.
    */
   async cancelBooking(bookingId: string): Promise<{ ok: boolean; status: number }> {
-    if (!this.page.url().startsWith(env.baseURL)) await this.page.goto("/book-now");
-    return this.page.evaluate(
-      async ({ apiURL, bookingId }) => {
-        const m = document.cookie.match(/(?:^|; )authToken=([^;]+)/);
-        let token = m ? decodeURIComponent(m[1]) : localStorage.getItem("authToken") ?? "";
-        try {
-          token = JSON.parse(token);
-        } catch {
-          /* plain string */
-        }
-        // The API's auth middleware also requires x-custom-access-id = the user id in the JWT
-        // (the app's axios interceptor sends both headers on every call).
-        let userId = "";
-        try {
-          const payload = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
-          userId = JSON.parse(atob(payload)).id ?? "";
-        } catch {
-          /* leave empty; the API will answer 401 and the cleanup annotation shows it */
-        }
-        const res = await fetch(`${apiURL}/booking/cancel/${bookingId}?wantRefund=true`, {
-          method: "PATCH",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
-            "x-custom-access-id": userId,
-          },
-          body: JSON.stringify({ refundType: "partial", cancelAsUser: true, cancellationReason: "Automated E2E test cleanup" }),
-        });
-        return { ok: res.ok, status: res.status };
-      },
-      { apiURL: env.apiURL, bookingId },
-    );
+    const { ok, status } = await this.authedFetch(`${env.apiURL}/booking/cancel/${bookingId}?wantRefund=true`, {
+      method: "PATCH",
+      body: { refundType: "partial", cancelAsUser: true, cancellationReason: "Automated E2E test cleanup" },
+    });
+    return { ok, status };
   }
 
   /**
@@ -736,24 +807,10 @@ export class BookingApp {
    * that a failed payment left no booking behind.
    */
   async myActiveBookingIds(): Promise<string[]> {
-    if (!this.page.url().startsWith(env.baseURL)) await this.page.goto("/book-now");
-    const result = await this.page.evaluate(async (apiURL) => {
-      const m = document.cookie.match(/(?:^|; )authToken=([^;]+)/);
-      let token = m ? decodeURIComponent(m[1]) : "";
-      try {
-        token = JSON.parse(token);
-      } catch {
-        /* plain string */
-      }
-      const userId = JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))).id ?? "";
-      const now = Date.now();
-      const start = new Date(now - 24 * 3600e3).toISOString();
-      const end = new Date(now + 4 * 24 * 3600e3).toISOString();
-      const res = await fetch(`${apiURL}/booking/getMyBookings?startDate=${start}&endDate=${end}`, {
-        headers: { Authorization: `Bearer ${token}`, "x-custom-access-id": userId },
-      });
-      return { status: res.status, body: await res.json().catch(() => null) };
-    }, env.apiURL);
+    const now = Date.now();
+    const start = new Date(now - 24 * 3600e3).toISOString();
+    const end = new Date(now + 4 * 24 * 3600e3).toISOString();
+    const result = await this.authedFetch(`${env.apiURL}/booking/getMyBookings?startDate=${start}&endDate=${end}`);
     expect(result.status, "GET /booking/getMyBookings").toBe(200);
     const list = unwrap<any[]>(result.body) ?? [];
     return (Array.isArray(list) ? list : []).filter((b) => !b.isCancelled).map((b) => String(b.id));
@@ -761,7 +818,7 @@ export class BookingApp {
 }
 
 /** Local wall-clock (date + minutes after midnight) in `tz` -> UTC epoch ms. */
-export function zonedToUtcMs(date: LocalDate, minutes: number, tz: string): number {
+function zonedToUtcMs(date: LocalDate, minutes: number, tz: string): number {
   const guess = Date.UTC(date.year, date.month - 1, date.day, 0, minutes);
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: tz,

@@ -55,7 +55,7 @@ fixed test OTP for the test account, set `TEETIME_TEST_OTP` and it logs in by it
 |---|---|
 | Everything (creating tests need `TEETIME_ALLOW_BOOKING_CREATION=true`) | `npm test` |
 | Watch it run in a visible browser | `npm run test:headed` |
-| Booking journey only (signup -> book -> confirmation -> calendar), visible | `npm run test:journey` |
+| Booking journey only (signup -> book -> confirmation -> calendar), visible | `npm run test:create` |
 | All negative cases (TC15–25), visible | `npm run test:negative` |
 | Payment errors only (TC18–25), visible | `npm run test:payment` |
 | No group size case (TC25), visible | `npm run test:no-group-size` |
@@ -106,7 +106,7 @@ fixed test OTP for the test account, set `TEETIME_TEST_OTP` and it logs in by it
 | TC6 header: location / date / selected time | `booking-ui.spec.ts` | no |
 | TC7 Book Now opens the correct modal | `booking-ui.spec.ts` | no |
 | TC10 Group-size + waiver validation | `booking-ui.spec.ts` | no |
-| TC11–14 Confirm → confirmation screen → View My Booking → visible on calendar | `booking-journey.spec.ts` | yes (1 shared) |
+| TC11–14 Confirm → confirmation screen → View My Booking → visible on calendar | `booking-create.spec.ts` | yes (1 shared) |
 | TC15 Unavailable (past / booked) slots can't be selected | `booking-negative.spec.ts` | no |
 | TC16 Error handling when booking creation fails (500 / success:false) | `booking-negative.spec.ts` | no (mocked) |
 | TC17 Double-click Confirm sends one create request (simulated success, nothing reaches staging) | `booking-negative.spec.ts` | no (mocked) |
@@ -115,8 +115,10 @@ fixed test OTP for the test account, set `TEETIME_TEST_OTP` and it logs in by it
 | TC25 No group size selected (waiver + valid card filled): blocked with the group-size error before any booking request | `payment-negative.spec.ts` | no |
 | TC27–31 Reschedule: book → ⋮ → Manage your booking → Reschedule → Start Rescheduling → new time → Reschedule → Confirm Changes → Reschedule details (waiver) → Confirm → Booking Confirmed → View My Booking → calendar shows the new time | `booking-reschedule.spec.ts` | yes (1) |
 | TC32–34 Update group size (same booking): ⋮ → Manage your booking → Update Group Size → Select Group Size → Add players → Reschedule details (waiver) → Confirm → Booking Confirmed → View My Booking → calendar shows the new group size | `booking-reschedule.spec.ts` | (TC27's booking) |
+| TC48–53 Quick shift: ⋮ → 15 min earlier / 15 min later → Reschedule booking (Current / New) → Confirm changes → Booking Confirmed (10 s) → View My Booking → calendar | `booking-reschedule.spec.ts` | yes (2) |
 | TC35–37 Cancel: book → ⋮ → Manage your booking → Cancel Booking → Confirm Cancellation → "Booking cancelled" → calendar shows the slots free | `booking-cancel.spec.ts` | yes (1, cancelled in the test) |
 | TC38–41 Extend: book → ⋮ → Manage your booking → Extend Booking → +30 min → Continue → Extend details (waiver, pay) → Confirm → Booking Confirmed → View My Booking → calendar shows the new end time | `booking-extend.spec.ts` | yes (1) |
+| TC54–57 Extend popup controls: + / −, presets, maximum (past midnight), slider → +45 min → Extend details → Booking Confirmed → calendar → My Booking | `booking-extend.spec.ts` | yes (1) |
 | TC20–24 Stripe test cards declined on charge (insufficient funds, declined, expired, incorrect CVC, processing error): error toast, user stays in the modal, no booking left | `payment-negative.spec.ts` | no (sends a real create request; the backend deletes the pending booking) |
 
 ## How the app behaves (from code analysis)

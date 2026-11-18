@@ -1,11 +1,12 @@
 import { env } from "../support/env";
 import { blockBookingCreation } from "../support/guards";
-import { expect, selectRequestedSlot, test } from "./fixtures";
+import { selectRequestedSlot } from "./helper";
+import { expect, test } from "./fixtures";
 
 /**
  * Test cases 1–5: every supported group size (1..5) can be chosen in the Booking Details modal and makes
  * the booking ready to confirm. Read-only: Confirm is NOT pressed, a route guard aborts any create request,
- * and each test asserts none was attempted. The one real booking per run is made by TC11 (booking-journey).
+ * and each test asserts none was attempted. The one real booking per run is made by TC11 (booking-create).
  */
 test.describe("Group sizes (no booking created)", () => {
   test.beforeEach(async ({ page }) => {

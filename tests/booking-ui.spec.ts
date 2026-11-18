@@ -1,7 +1,8 @@
 import { env } from "../support/env";
 import { blockBookingCreation, toast } from "../support/guards";
 import { headerLabel, isoDate } from "../support/time";
-import { expect, selectRequestedSlot, test } from "./fixtures";
+import { selectRequestedSlot } from "./helper";
+import { expect, test } from "./fixtures";
 
 /**
  * Test cases 6, 7 and 10 — read-only: they never create a booking. (The waiver page is not opened;

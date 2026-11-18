@@ -1,18 +1,20 @@
-import { test as base, expect, type BrowserContext, type ConsoleMessage, type Request, type TestInfo } from "@playwright/test";
+import { test as base, expect, type BrowserContext, type ConsoleMessage, type Request } from "@playwright/test";
 import * as fs from "fs";
 import * as path from "path";
-import { BlockedError, BookingApp, annotateBlocked, type CreatedBooking, type SelectedBooking } from "../support/booking-app";
-import { bookingCreationBlockedReason, env } from "../support/env";
+import { BookingApp } from "../support/booking-app";
+import { env } from "../support/env";
 import { CURSOR_GLIDE_MS, installCursor } from "../support/cursor";
-import { addDays, isoDate } from "../support/time";
+
+/**
+ * Playwright fixtures only: the run's one Chrome window (sharedContext, with the test user's login) and the
+ * per-test `app` page object. All common helper functions live in ./helper.ts.
+ */
 
 /** How this run's test user got in (signup mode only): "signup" = new user created, "login" = existing user. */
 export const testUser: { email?: string; result?: "login" | "signup" } = {};
 
 type Fixtures = {
   app: BookingApp;
-  /** Bookings created by the current test; cancelled afterwards when TEETIME_CLEANUP=true. */
-  created: CreatedBooking[];
 };
 
 type WorkerFixtures = {
@@ -67,7 +69,20 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
             otp: env.testOtp,
           });
 
-        let email = readSavedTestUser(userFile) ?? newEmail();
+        // A browser restarted after a failed test (same run): reuse that run's login, no login popup again
+        const sessionFile = path.join(path.dirname(env.storageState), "run-session.json");
+        const saved = readSavedTestUser(userFile);
+        if (saved && (await reuseRunSession(app, context, sessionFile, saved))) {
+          app.api.detach();
+          testUser.email = saved;
+          testUser.result = "login";
+          console.log(`[teetime-e2e] reused this run's login for ${saved} (browser restarted; no new code)`);
+          await use(context);
+          await context.close();
+          return;
+        }
+
+        let email = saved ?? newEmail();
         let result = await login(email);
         if (result === "blocked") {
           console.log(`[teetime-e2e] test user ${email} is blocked; creating a new one`);
@@ -87,6 +102,9 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
         // Keep this run's login on disk for reference. A separate file, so the saved account from `npm run auth`
         // (TEETIME_STORAGE_STATE, used by TEETIME_AUTH_MODE=saved) is never overwritten.
         await context.storageState({ path: path.join(path.dirname(env.storageState), "last-signup-user.json") });
+        // For browsers restarted later in this run (see reuseRunSession). .auth/ is git-ignored.
+        const { cookies } = await context.storageState();
+        fs.writeFileSync(sessionFile, JSON.stringify({ runId: process.env.TEETIME_RUN_ID, email, cookies }));
       }
 
       await use(context);
@@ -129,23 +147,6 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
       if (logs.length) await testInfo.attach("browser-errors.txt", { body: logs.join("\n"), contentType: "text/plain" });
     }
   },
-
-  created: async ({ app }, use, testInfo) => {
-    const created: CreatedBooking[] = [];
-    await use(created);
-    if (created.length) {
-      await testInfo.attach("created-bookings.json", {
-        body: JSON.stringify(created.map(({ bookingId, bayName, groupSize, date }) => ({ bookingId, bayName, groupSize, date })), null, 2),
-        contentType: "application/json",
-      });
-    }
-    if (env.cleanup) {
-      for (const b of created) {
-        const res = await app.cancelBooking(b.bookingId);
-        testInfo.annotations.push({ type: "cleanup", description: `cancel ${b.bookingId}: HTTP ${res.status}` });
-      }
-    }
-  },
 });
 
 export { expect };
@@ -161,72 +162,21 @@ function readSavedTestUser(file: string): string | null {
   }
 }
 
-/** Skip creation tests unless staging + explicit opt-in. */
-export function requireBookingCreation() {
-  const reason = bookingCreationBlockedReason();
-  test.skip(!!reason, reason ?? "");
-}
-
-/** Converts a staging-data problem (no free slot, date not allowed, no saved card) into a reported BLOCKED skip. */
-export async function orBlocked<T>(testInfo: TestInfo, fn: () => Promise<T>): Promise<T> {
+/**
+ * Reuse the login made earlier in this run (only this run's session file, only for the same test user): put its
+ * cookies in the new browser and open /book-now. True when the calendar loads signed in; otherwise the cookies are
+ * removed and the caller logs in with the email code as usual.
+ */
+async function reuseRunSession(app: BookingApp, context: BrowserContext, file: string, email: string): Promise<boolean> {
   try {
-    return await fn();
-  } catch (e) {
-    if (e instanceof BlockedError) {
-      annotateBlocked(testInfo, e.message);
-      test.skip(true, e.message);
-    }
-    throw e;
+    if (!fs.existsSync(file)) return false;
+    const s = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!process.env.TEETIME_RUN_ID || s.runId !== process.env.TEETIME_RUN_ID || s.email !== email) return false;
+    await context.addCookies(s.cookies);
+    await app.open(); // throws when the login popup shows (session no longer valid)
+    return true;
+  } catch {
+    await context.clearCookies();
+    return false;
   }
-}
-
-/** Steps 1–3: open site, select location, go to the booking date, pick a free bay, select the slot range. */
-export async function selectRequestedSlot(
-  app: BookingApp,
-  testInfo: TestInfo,
-  excludeBayIds: string[] = [],
-  {
-    reuseOpenPage = false,
-    tryNextDays = 0,
-    alsoFree,
-  }: {
-    reuseOpenPage?: boolean;
-    /** No free bay on the date: click the calendar's next arrow and check up to this many following days. */
-    tryNextDays?: number;
-    /** The chosen bay must also be free for this slot range (see findAvailableBay). */
-    alsoFree?: { startIdx: number; endIdx: number };
-  } = {},
-): Promise<SelectedBooking> {
-  return orBlocked(testInfo, async () => {
-    await test.step("Open booking site", async () => {
-      // reuseOpenPage: stay on the calendar that is already open instead of reloading it
-      if (reuseOpenPage) await app.openIfNeeded();
-      else await app.open();
-    });
-    await test.step(`Select location "${env.locationName}"`, async () => {
-      await app.selectLocation(env.locationName);
-      await app.verifyLocationData(env.locationName);
-    });
-    let date = app.targetDate();
-    await test.step(`Go to booking date (+${env.daysAhead} day)`, async () => {
-      await app.goToDate(date);
-    });
-    return test.step(`Pick a bay free ${env.slotStart}–${env.slotEnd}`, async () => {
-      for (let day = 0; ; day++) {
-        try {
-          const bay = await app.findAvailableBay(date, excludeBayIds, alsoFree);
-          if (day > 0) testInfo.annotations.push({ type: "date", description: `moved ${day} day(s) ahead to ${isoDate(date)}` });
-          const sel = await app.selectRange(bay, date);
-          await app.verifySelectionHeader(sel);
-          return sel;
-        } catch (e) {
-          if (!(e instanceof BlockedError) || day >= tryNextDays) throw e;
-          // Time taken in every bay: next day via the calendar's › button (goToDate stops if the app blocks the date)
-          console.log(`[teetime-e2e] ${env.slotStart}–${env.slotEnd} not free on ${isoDate(date)}; trying the next day`);
-          date = addDays(date, 1);
-          await app.goToDate(date);
-        }
-      }
-    });
-  });
 }

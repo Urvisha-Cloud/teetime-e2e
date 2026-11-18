@@ -1,6 +1,7 @@
-import { BookingApp, type CreatedBooking, type SelectedBooking } from "../support/booking-app";
+import type { BookingApp, CreatedBooking } from "../support/booking-app";
 import { env } from "../support/env";
-import { expect, orBlocked, requireBookingCreation, selectRequestedSlot, test } from "./fixtures";
+import { bookingSuite, bookSlot, requireBookingCreation, selectRequestedSlot } from "./helper";
+import { expect, test } from "./fixtures";
 
 /**
  * Test cases 11–14 — the ONLY real booking the suite creates per run, verified stage by stage.
@@ -8,47 +9,23 @@ import { expect, orBlocked, requireBookingCreation, selectRequestedSlot, test } 
  * Uses the run-wide shared Chrome window (see `sharedContext` in fixtures.ts), so no extra window opens.
  */
 test.describe("Booking journey: confirm → confirmation screen → View My Booking @creates-booking", () => {
-  test.describe.configure({ mode: "serial" });
-
   let app: BookingApp;
-  let sel: SelectedBooking;
+  const suite = bookingSuite((a) => (app = a));
   let booking: CreatedBooking | undefined;
   const GROUP_SIZE = 3;
 
-  test.beforeAll(async ({ sharedContext }) => {
-    app = new BookingApp(sharedContext.pages()[0] ?? (await sharedContext.newPage()));
-  });
-
-  test.afterAll(async () => {
-    if (booking && env.cleanup) {
-      const res = await app.cancelBooking(booking.bookingId);
-      console.log(`[teetime-e2e] cleanup: cancel ${booking.bookingId}: HTTP ${res.status}`);
-    }
-    app?.api.detach(); // the window stays open for the next tests; it is closed once at the end of the run
-  });
-
-  test.afterEach(async ({}, testInfo) => {
-    if (testInfo.status !== testInfo.expectedStatus) {
-      await testInfo.attach("failure.png", { body: await app.page.screenshot({ fullPage: true }), contentType: "image/png" });
-    }
-  });
-
   test("TC11: Confirm Booking creates the booking", async ({}, testInfo) => {
     requireBookingCreation();
-    sel = await selectRequestedSlot(app, testInfo);
-    const modal = await app.openBookingModal(sel);
-    await app.selectGroupSize(modal, GROUP_SIZE);
-    await app.acceptWaiver(modal); // tick the checkbox only; the waiver page is not opened
-    await orBlocked(testInfo, () => app.preparePayment(modal));
-
+    const sel = await selectRequestedSlot(app, testInfo);
     const before = app.api.createRequests.length;
-    const bookingId = await app.confirmBooking(modal); // asserts HTTP < 400, success=true, bookingId, redirect
+    // Group size, waiver (the checkbox only; the waiver page is not opened), payment -> Confirm
+    // (asserts HTTP < 400, success=true, bookingId and the redirect)
+    booking = await bookSlot(app, testInfo, sel, { groupSize: GROUP_SIZE });
+    suite.track(booking);
     expect(app.api.createRequests.length - before, "exactly one create request").toBe(1);
     const sent = app.api.createRequests.at(-1)!.postDataJSON();
     expect(sent.numberOfPersons).toBe(GROUP_SIZE);
     expect(sent.bayId).toBe(sel.bayId);
-    booking = { ...sel, bookingId, groupSize: GROUP_SIZE };
-    testInfo.annotations.push({ type: "bookingId", description: bookingId });
   });
 
   test("TC12: confirmation (checkout) screen shows the booking details", async () => {

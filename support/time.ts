@@ -21,6 +21,13 @@ export function todayIn(tz: string, now = new Date()): LocalDate {
   return { year: get("year"), month: get("month"), day: get("day") };
 }
 
+/** Minutes since midnight right now in an IANA timezone. */
+export function nowMinutesIn(tz: string, now = new Date()): number {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(now);
+  const get = (t: string) => Number(parts.find((p) => p.type === t)!.value);
+  return get("hour") * 60 + get("minute");
+}
+
 export function addDays(d: LocalDate, n: number): LocalDate {
   const dt = new Date(Date.UTC(d.year, d.month - 1, d.day + n));
   return { year: dt.getUTCFullYear(), month: dt.getUTCMonth() + 1, day: dt.getUTCDate() };

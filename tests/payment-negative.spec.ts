@@ -1,7 +1,8 @@
 import { blockBookingCreation, toast } from "../support/guards";
 import { CREATE_BOOKING_RE } from "../support/network";
 import { env } from "../support/env";
-import { expect, orBlocked, requireBookingCreation, selectRequestedSlot, test } from "./fixtures";
+import { fillBookingModal, requireBookingCreation, selectRequestedSlot } from "./helper";
+import { expect, test } from "./fixtures";
 
 /**
  * Payment negative cases. Group-size and waiver validation are covered by TC10 (booking-ui.spec.ts).
@@ -17,16 +18,15 @@ import { expect, orBlocked, requireBookingCreation, selectRequestedSlot, test } 
 const TEST_EXP = "1234"; // 12/34
 const TEST_CVC = "123";
 const TEST_ZIP = "12345";
+/** A Stripe test card number with the test expiry / CVC and a ZIP code. */
+const testCard = (card: string, zip = TEST_ZIP) => ({ card, exp: TEST_EXP, cvc: TEST_CVC, zip });
 
 test.describe("Payment errors (no booking is created)", () => {
   test("TC18: invalid card number is rejected before the booking request is sent", async ({ app, page }, testInfo) => {
     await blockBookingCreation(page);
     const sel = await selectRequestedSlot(app, testInfo);
-    const modal = await app.openBookingModal(sel);
-    await app.selectGroupSize(modal, 1);
-    await app.acceptWaiver(modal);
     // Same as Stripe's 4242 test number with the last digit changed, so the card number check fails.
-    await app.enterCard(modal, { card: "4242424242424241", exp: TEST_EXP, cvc: TEST_CVC, zip: TEST_ZIP });
+    const modal = await fillBookingModal(app, testInfo, sel, { card: testCard("4242424242424241") });
     await app.confirmButton(modal).click();
 
     await expect(toast(page, /card number is invalid/i)).toBeVisible();
@@ -38,10 +38,7 @@ test.describe("Payment errors (no booking is created)", () => {
   test("TC19: missing ZIP code is rejected before the booking request is sent", async ({ app, page }, testInfo) => {
     await blockBookingCreation(page);
     const sel = await selectRequestedSlot(app, testInfo);
-    const modal = await app.openBookingModal(sel);
-    await app.selectGroupSize(modal, 1);
-    await app.acceptWaiver(modal);
-    await app.enterCard(modal, { card: "4242424242424242", exp: TEST_EXP, cvc: TEST_CVC, zip: "" });
+    const modal = await fillBookingModal(app, testInfo, sel, { card: testCard("4242424242424242", "") });
     await app.confirmButton(modal).click();
 
     await expect(modal.getByText("Please enter a valid ZIP Code")).toBeVisible();
@@ -55,7 +52,7 @@ test.describe("Payment errors (no booking is created)", () => {
     const modal = await app.openBookingModal(sel);
     // Everything else is valid (waiver ticked, valid test card) — only the group size is missing.
     await app.acceptWaiver(modal);
-    await app.enterCard(modal, { card: "4242424242424242", exp: TEST_EXP, cvc: TEST_CVC, zip: TEST_ZIP });
+    await app.enterCard(modal, testCard("4242424242424242"));
     await app.confirmButton(modal).click();
 
     await expect(modal.getByText("Please select a group size to proceed with your booking.")).toBeVisible();
@@ -79,10 +76,7 @@ test.describe("Payment errors (no booking is created)", () => {
       const before = await app.myActiveBookingIds();
 
       const sel = await selectRequestedSlot(app, testInfo);
-      const modal = await app.openBookingModal(sel);
-      await app.selectGroupSize(modal, 1);
-      await app.acceptWaiver(modal);
-      await orBlocked(testInfo, () => app.enterCard(modal, { card: d.card, exp: TEST_EXP, cvc: TEST_CVC, zip: TEST_ZIP }));
+      const modal = await fillBookingModal(app, testInfo, sel, { card: testCard(d.card) });
 
       const responsePromise = page.waitForResponse(
         (r) => r.request().method() === "POST" && r.url().startsWith(env.apiURL) && CREATE_BOOKING_RE.test(r.url()),
