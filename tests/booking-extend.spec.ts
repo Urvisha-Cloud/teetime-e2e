@@ -35,6 +35,7 @@ import { expect, test } from "./fixtures";
  *  TC94–95  the extra time is taken while extending (the API's "already booked" answer, simulated) -> booking unchanged
  *  TC96–97  the latest booking of the day extended past midnight -> Booking Confirmed with the next-day end time
  *  TC98–99  a session in progress -> the floating "Extend session" button -> +15 min -> Booking Confirmed
+ *  TC100–102 (extend to another bay) are in switch-bay-extend.spec.ts, the last part of npm test
  */
 
 test.describe("Extend a booking @creates-booking", () => {

@@ -15,7 +15,7 @@ export interface ApiLocation {
   id: string;
   name: string;
   timezone?: { value?: string; label?: string };
-  bays?: { id: string; name: string; type?: string; order?: number; isActive?: boolean }[];
+  bays?: { id: string; name: string; type?: string; order?: number; isActive?: boolean; /** "Impact Vision" or "Trackman" (admin) */ technology?: string }[];
 }
 
 /** Unwraps `{ data: X }` envelopes the API may use. */

@@ -20,6 +20,9 @@ if (process.argv.some((a) => a === "--project=setup" || a === "setup")) process.
 // One id per run (set in the main process; workers inherit it): a browser restarted after a failed test reuses the
 // login made earlier in the SAME run instead of showing the login popup again (tests/fixtures.ts).
 process.env.TEETIME_RUN_ID ??= String(Date.now());
+// `npm test` (it runs booking-flow.spec.ts, whose TC42 is the login step) always logs in fresh. Feature commands
+// (npm run test:extend, test:cancel, …) reuse the login saved by an earlier run and open the calendar directly.
+if (process.argv.some((a) => a.includes("booking-flow.spec"))) process.env.TEETIME_FRESH_LOGIN ??= "1";
 const isAuthRun = process.env.TEETIME_AUTH_RUN === "1";
 
 // Which browser runs the tests: by this computer — Windows / Linux: Google Chrome, macOS: Safari (WebKit) — or

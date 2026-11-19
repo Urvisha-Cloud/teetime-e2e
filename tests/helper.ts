@@ -176,10 +176,14 @@ export async function selectRequestedSlot(
       for (let day = 0; ; day++) {
         // The earliest time of the day where a bay is free for the booking and everything the test needs after it
         let found: Awaited<ReturnType<typeof freeBay>> = new BlockedError(`no start time fits on ${isoDate(date)}`);
-        // Today: only starts at least TEETIME_MIN_LEAD_MINUTES from now (reschedule is blocked within 4 hours of the start)
-        const isToday = compareDates(date, todayIn(app.tz)) === 0;
+        // Only starts at least TEETIME_MIN_LEAD_MINUTES from now (reschedule is blocked within 4 hours of the start).
+        // Counted across midnight: at 10 PM, tomorrow's first allowed start is 2:30 AM, not 12:00 AM.
+        const daysFromToday = Math.round(compareDates(date, todayIn(app.tz)) / 86_400_000);
+        const isToday = daysFromToday === 0;
         const now = isToday ? nowMinutesIn(app.tz) : 0;
-        const earliest = isToday ? now + (todayWindow ? todayWindow.min : env.minLeadMinutes) : 0;
+        const earliest = isToday
+          ? now + (todayWindow ? todayWindow.min : env.minLeadMinutes)
+          : nowMinutesIn(app.tz) + env.minLeadMinutes - daysFromToday * 24 * 60; // <= 0 from the 2nd day on: any time
         const latest = isToday && todayWindow ? now + todayWindow.max : Infinity;
         for (const start of startSlots(alsoFree, { rescheduleRoom, latestFirst })) {
           if (start * 15 < earliest || start * 15 > latest) continue;
@@ -272,12 +276,16 @@ export async function bookFreeSlot(
   app: BookingApp,
   testInfo: TestInfo,
   options: Parameters<typeof selectRequestedSlot>[3] = {},
-  { groupSize = 1, attempts = 3 }: { groupSize?: number; attempts?: number } = {},
+  {
+    groupSize = 1,
+    attempts = 3,
+    excludeBayIds = [],
+  }: { groupSize?: number; attempts?: number; /** never book these bays (e.g. all but Impact Vision) */ excludeBayIds?: string[] } = {},
 ): Promise<CreatedBooking> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     // Retries reload the page, so the calendar shows the latest availability
-    const sel = await selectRequestedSlot(app, testInfo, [], attempt === 1 ? options : { ...options, reuseOpenPage: false });
+    const sel = await selectRequestedSlot(app, testInfo, excludeBayIds, attempt === 1 ? options : { ...options, reuseOpenPage: false });
     const before = new Set(await app.myActiveBookingIds());
     try {
       return await bookSlot(app, testInfo, sel, { groupSize });

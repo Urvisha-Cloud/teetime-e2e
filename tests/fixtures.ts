@@ -69,14 +69,16 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
             otp: env.testOtp,
           });
 
-        // A browser restarted after a failed test (same run): reuse that run's login, no login popup again
+        // Reuse a saved login instead of the login popup: feature commands (npm run test:extend, …) reuse the last
+        // saved one and open the calendar directly; npm test only reuses its own run's (a browser restarted after a
+        // failed test). See reuseRunSession.
         const sessionFile = path.join(path.dirname(env.storageState), "run-session.json");
         const saved = readSavedTestUser(userFile);
         if (saved && (await reuseRunSession(app, context, sessionFile, saved))) {
           app.api.detach();
           testUser.email = saved;
           testUser.result = "login";
-          console.log(`[teetime-e2e] reused this run's login for ${saved} (browser restarted; no new code)`);
+          console.log(`[teetime-e2e] reused the saved login for ${saved}: calendar opened directly, no login popup`);
           await use(context);
           await context.close();
           return;
@@ -163,15 +165,18 @@ function readSavedTestUser(file: string): string | null {
 }
 
 /**
- * Reuse the login made earlier in this run (only this run's session file, only for the same test user): put its
- * cookies in the new browser and open /book-now. True when the calendar loads signed in; otherwise the cookies are
- * removed and the caller logs in with the email code as usual.
+ * Reuse a saved login (only for the same test user): put its cookies in the new browser and open /book-now. True
+ * when the calendar loads signed in; otherwise the cookies are removed and the caller logs in with the email code.
+ *  - npm test (TEETIME_FRESH_LOGIN): logs in fresh once; afterwards only that run's session is reused
+ *  - every other command: the last saved session from any run (the app's login lasts 180 days)
  */
 async function reuseRunSession(app: BookingApp, context: BrowserContext, file: string, email: string): Promise<boolean> {
   try {
     if (!fs.existsSync(file)) return false;
     const s = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (!process.env.TEETIME_RUN_ID || s.runId !== process.env.TEETIME_RUN_ID || s.email !== email) return false;
+    if (s.email !== email) return false;
+    const sameRun = !!process.env.TEETIME_RUN_ID && s.runId === process.env.TEETIME_RUN_ID;
+    if (process.env.TEETIME_FRESH_LOGIN === "1" && !sameRun) return false;
     await context.addCookies(s.cookies);
     await app.open(); // throws when the login popup shows (session no longer valid)
     return true;

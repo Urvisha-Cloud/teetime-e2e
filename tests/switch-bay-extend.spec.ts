@@ -1,0 +1,249 @@
+import type { TestInfo } from "@playwright/test";
+import type { BaySlotState, BookingApp, CreatedBooking, SelectedBooking } from "../support/booking-app";
+import { env } from "../support/env";
+import { fromMinutes } from "../support/time";
+import {
+  bookFreeSlot,
+  bookingSuite,
+  bookSlot,
+  expectConfirmed,
+  formatMinutes,
+  openExtendPopup,
+  orBlocked,
+  requireBookingCreation,
+  slotsAfterRequested,
+} from "./helper";
+import { expect, test } from "./fixtures";
+
+/**
+ * Extend to another bay, the last part of npm test. Both cases: only 30 min free after the booking (another booking
+ * starts then) -> Extend -> +30 min (the limit) -> a "book a new session" option -> pick a bay in the dropdown -> 1 hr
+ * -> Continue -> Booking Details -> the new session on that bay is booked.
+ *  TC100–102 "Switch bay, keep playing" (another bay of any kind)
+ *  TC103–105 "Switch to Trackman" (the green promo; only offered when the booking is on an Impact Vision bay)
+ * Kept in its own file because Playwright runs files in name order: "switch-…" sorts after booking-flow,
+ * booking-reschedule and refund-cancel, so npm test runs it last. Also part of npm run test:extend.
+ */
+
+const GAP = 2; // 30 min free after the first booking
+const HOUR = 4;
+
+// Bay technology from /location/get-location-with-bays ("Impact Vision" or "Trackman", set in admin)
+const isTech = (bay: { technology?: string }, tech: string) => bay.technology?.trim().toLowerCase() === tech;
+
+/**
+ * Books a free hour (never on `excludeBayIds`), then another booking in the same bay starting 30 min after it,
+ * so the Extend popup stops at +30 min.
+ */
+async function bookWithBlockerAfter(
+  app: BookingApp,
+  testInfo: TestInfo,
+  track: (b: CreatedBooking) => void,
+  excludeBayIds: string[] = [],
+) {
+  const first = await bookFreeSlot(
+    app,
+    testInfo,
+    { reuseOpenPage: true, rescheduleRoom: false, alsoFree: slotsAfterRequested(GAP + HOUR) },
+    { excludeBayIds },
+  );
+  track(first);
+  await app.viewMyBooking(first, { highlight: false });
+
+  const start = first.endIdx + 1 + GAP;
+  const sel: SelectedBooking = {
+    ...first,
+    startIdx: start,
+    endIdx: start + HOUR - 1,
+    startTime: fromMinutes(start * 15),
+    endTime: fromMinutes((start + HOUR) * 15),
+  };
+  await app.selectSlots(sel.bayId, sel.startIdx, sel.endIdx);
+  await app.verifySelectionHeader(sel);
+  const blocker = await bookSlot(app, testInfo, sel);
+  await expectConfirmed(app, blocker);
+  await app.viewMyBooking(first, { highlight: false });
+  await app.verifyBookingOnCalendar(blocker);
+  return { first, blocker };
+}
+
+/** Extend popup on `f` -> "+30 min" (the limit) -> the "Need more than 30 min?" options are shown. */
+async function extendToTheLimit(app: BookingApp, f: CreatedBooking) {
+  const popup = await openExtendPopup(app, f);
+  await expect(popup, "limit in the subtitle").toContainText(`Up to ${formatMinutes(GAP * 15)} available after your session`);
+  // The other sessions are offered once the extra time is at the limit
+  await app.guidedClick(popup.getByRole("button", { name: "+30 min", exact: true }), { read: app.readMs });
+  await expect(popup).toContainText(`Need more than ${formatMinutes(GAP * 15)}? Book a new session`);
+  return popup;
+}
+
+/**
+ * The new-session view after an option was picked (subtitle "<option> · <bay>"): Bay dropdown -> pick one of
+ * `freeBays` (the 2nd in the list when there are several, so the choice really changes) -> 1 hr -> preview -> Continue.
+ * Then the calendar selects it and Booking Details opens. Returns the selected session.
+ */
+async function pickBayAndContinue(
+  app: BookingApp,
+  testInfo: TestInfo,
+  f: CreatedBooking,
+  option: string,
+  freeBays: BaySlotState[],
+): Promise<SelectedBooking> {
+  const hour = { startIdx: f.endIdx + 1, endIdx: f.endIdx + HOUR };
+  // The subtitle changes, so find the popup by its new text
+  const picked = app.dialog("How long do you want to play?");
+  await expect(picked).toBeVisible();
+  await expect(picked).toContainText(`${option} ·`);
+  const bayDropdown = picked.getByRole("combobox");
+  await expect(bayDropdown).toBeVisible();
+  await app.guidedClick(bayDropdown, { read: app.readMs });
+  const options = app.page.getByRole("option");
+  await expect(options.first()).toBeVisible();
+  const names = (await options.allInnerTexts()).map((t) => t.split("·")[0].trim());
+  testInfo.annotations.push({ type: "bay-options", description: names.join(", ") });
+  const choice = names[names.length > 1 ? 1 : 0];
+  const bay = freeBays.find((b) => b.bayName === choice);
+  expect(bay, `"${choice}" from the dropdown is one of the bays free from ${f.endTime}`).toBeTruthy();
+  await app.guidedClick(options.filter({ hasText: choice }).first(), { read: app.readMs });
+  await expect(bayDropdown).toContainText(choice);
+  await expect(picked, "subtitle names the chosen bay").toContainText(`${option} · ${choice}`);
+
+  // 1 hr from where the first booking ends, on the chosen bay
+  const next: SelectedBooking = {
+    ...f,
+    bayId: bay!.bayId,
+    bayName: bay!.bayName,
+    startIdx: hour.startIdx,
+    endIdx: hour.endIdx,
+    startTime: f.endTime,
+    endTime: fromMinutes((hour.endIdx + 1) * 15),
+  };
+  await expect(picked.locator("div.text-2xl"), "session length").toHaveText(formatMinutes(HOUR * 15));
+  await expect(picked, "preview: bay and time").toContainText(`${next.bayName} · ${next.startTime} – ${next.endTime}`);
+  await app.guidedClick(picked.getByRole("button", { name: /Continue/ }), { read: app.readMs });
+  await expect(picked).toBeHidden();
+
+  // Continue selects the new session on that bay, then the app opens Booking Details right away
+  // (bay, time and date filled in); the header's Book Now is behind it, so check the modal instead.
+  for (let s = next.startIdx; s <= next.endIdx; s++) await expect(app.cell(next.bayId, s)).toHaveClass(/bg-green-400\/50/);
+  const modal = app.modal();
+  if (await modal.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await expect(modal.getByRole("heading", { name: "Booking Details" })).toBeVisible();
+    await app.verifyModalDetails(modal, next); // location, time, date, the chosen bay
+  } else {
+    await app.verifySelectionHeader(next);
+  }
+  return next;
+}
+
+/** Booking Details (already open, or via Book Now) -> group size, waiver, payment -> Confirm -> Booking Confirmed. */
+async function bookNewSession(app: BookingApp, testInfo: TestInfo, next: SelectedBooking, unchanged: CreatedBooking[]) {
+  const modal = app.modal();
+  let booked: CreatedBooking;
+  if (await modal.isVisible().catch(() => false)) {
+    await app.readPause();
+    await app.selectGroupSize(modal, 1);
+    await app.scrollThrough(modal);
+    await app.acceptWaiver(modal);
+    await orBlocked(testInfo, () => app.preparePayment(modal));
+    const bookingId = await app.confirmBooking(modal, { read: Math.min(1500, app.readMs) });
+    testInfo.annotations.push({ type: "bookingId", description: bookingId });
+    booked = { ...next, bookingId, groupSize: 1 };
+  } else {
+    booked = await bookSlot(app, testInfo, next); // Book Now -> Booking Details -> …
+  }
+  await expectConfirmed(app, booked);
+  await app.viewMyBooking(booked);
+  // The first booking keeps its own time (not extended), the blocker is unchanged
+  for (const b of unchanged) await app.verifyBookingOnCalendar(b);
+  return booked;
+}
+
+// ───────────────────────────── Switch bay, keep playing ─────────────────────────────
+
+test.describe("Extend to another bay: Switch bay, keep playing @creates-booking", () => {
+  let app: BookingApp;
+  const suite = bookingSuite((a) => (app = a), { watch: true });
+  let first: CreatedBooking | undefined; // the booking we try to extend
+  let blocker: CreatedBooking | undefined; // starts 30 min after it in the same bay
+  let next: SelectedBooking | undefined; // the 1-hour session on the bay picked in the dropdown
+
+  test("TC100: book a free hour, then another booking in the same bay starting 30 min after it", async ({}, testInfo) => {
+    requireBookingCreation();
+    ({ first, blocker } = await bookWithBlockerAfter(app, testInfo, (b) => suite.track(b)));
+  });
+
+  test("TC101: Extend -> +30 min (the limit) -> Switch bay, keep playing -> pick a bay in the dropdown -> 1 hr -> Continue", async ({}, testInfo) => {
+    test.skip(!first || !blocker, "TC100 did not create both bookings");
+    const f = first!;
+    // Which other bays are free for the hour after the booking (what "Switch bay" can offer)
+    const freeBays = (await app.baysForRange(f.endIdx + 1, f.endIdx + HOUR)).filter((x) => x.bayId !== f.bayId && x.free);
+    testInfo.annotations.push({ type: "free-bays", description: `from ${f.endTime}: ${freeBays.map((b) => b.bayName).join(", ") || "none"}` });
+    if (freeBays.length === 0) test.skip(true, `No other bay is free for an hour from ${f.endTime}, so Switch bay is not offered`);
+
+    const popup = await extendToTheLimit(app, f);
+    const switchBay = popup.getByRole("button").filter({ hasText: "Switch bay, keep playing" });
+    await expect(switchBay).toBeVisible();
+    await expect(switchBay).toContainText(`from ${f.endTime}`);
+    await app.guidedClick(switchBay, { read: app.readMs });
+    next = await pickBayAndContinue(app, testInfo, f, "Switch bay, keep playing", freeBays);
+  });
+
+  test("TC102: Booking Details -> group size, waiver, payment -> Confirm -> the new session on the other bay is booked", async ({}, testInfo) => {
+    test.skip(!next, "TC101 did not select the new session");
+    suite.track(await bookNewSession(app, testInfo, next!, [first!, blocker!]));
+  });
+});
+
+// ───────────────────────────── Switch to Trackman ─────────────────────────────
+
+test.describe("Extend to another bay: Switch to Trackman @creates-booking", () => {
+  let app: BookingApp;
+  const suite = bookingSuite((a) => (app = a), { watch: true });
+  let trackmanIds: string[] = [];
+  let first: CreatedBooking | undefined; // on an Impact Vision bay
+  let blocker: CreatedBooking | undefined;
+  let next: SelectedBooking | undefined; // the 1-hour session on the Trackman bay picked in the dropdown
+
+  test("TC103: book a free hour on an Impact Vision bay, then another booking in the same bay starting 30 min after it", async ({}, testInfo) => {
+    requireBookingCreation();
+    await app.openIfNeeded();
+    await app.loadLocations();
+    const bays = app.api.location(env.locationName)?.bays ?? [];
+    trackmanIds = bays.filter((b) => isTech(b, "trackman")).map((b) => b.id);
+    const impactVision = bays.filter((b) => isTech(b, "impact vision"));
+    testInfo.annotations.push({
+      type: "bays",
+      description: `Impact Vision: ${impactVision.map((b) => b.name).join(", ") || "none"}; Trackman: ${bays.filter((b) => isTech(b, "trackman")).map((b) => b.name).join(", ") || "none"}`,
+    });
+    test.skip(impactVision.length === 0 || trackmanIds.length === 0, `${env.locationName} needs both an Impact Vision and a Trackman bay`);
+    // The booking must be on an Impact Vision bay: the Trackman option is only offered from there
+    const notImpactVision = bays.filter((b) => !isTech(b, "impact vision")).map((b) => b.id);
+    ({ first, blocker } = await bookWithBlockerAfter(app, testInfo, (b) => suite.track(b), notImpactVision));
+  });
+
+  test("TC104: Extend -> +30 min (the limit) -> Switch to Trackman -> pick a Trackman bay in the dropdown -> 1 hr -> Continue", async ({}, testInfo) => {
+    test.skip(!first || !blocker, "TC103 did not create both bookings");
+    const f = first!;
+    // Trackman bays free for the hour after the booking
+    const freeTrackman = (await app.baysForRange(f.endIdx + 1, f.endIdx + HOUR)).filter((x) => trackmanIds.includes(x.bayId) && x.free);
+    testInfo.annotations.push({ type: "free-trackman", description: `from ${f.endTime}: ${freeTrackman.map((b) => b.bayName).join(", ") || "none"}` });
+    if (freeTrackman.length === 0) test.skip(true, `No Trackman bay is free for an hour from ${f.endTime}, so Switch to Trackman is not offered`);
+
+    const popup = await extendToTheLimit(app, f);
+    // The green promo at the end of the options: "Want to keep playing? … Trackman bay(s) … free right after your session"
+    await expect(popup).toContainText("Want to keep playing?");
+    await expect(popup).toContainText(/Trackman bays? (\(.+\) )?(is|are) free/);
+    await expect(popup).toContainText("right after your session");
+    const toTrackman = popup.getByRole("button", { name: /Switch to Trackman/ });
+    await expect(toTrackman).toBeVisible();
+    await app.guidedClick(toTrackman, { read: app.readMs });
+    next = await pickBayAndContinue(app, testInfo, f, "Switch to Trackman", freeTrackman);
+  });
+
+  test("TC105: Booking Details -> group size, waiver, payment -> Confirm -> the new session on the Trackman bay is booked", async ({}, testInfo) => {
+    test.skip(!next, "TC104 did not select the new session");
+    suite.track(await bookNewSession(app, testInfo, next!, [first!, blocker!]));
+  });
+});
+

@@ -87,14 +87,13 @@ export class BookingApp {
    */
   async stayOnBookNow(since: number) {
     const loginShown = this.page.locator("input#email");
-    await expect
-      .poll(
-        async () =>
-          this.api.myBookingsLoadedAt >= since || (await loginShown.isVisible()) || new URL(this.page.url()).pathname === "/my-bookings",
-        { timeout: 3_000 }, // short: booking-ui without that switch (removed there) never sends this request
-      )
-      .toBe(true)
-      .catch(() => {}); // not seen in time: carry on, the URL check below still applies
+    // An optional wait, so a plain loop: a timed-out expect.poll() would count as a test failure even when caught.
+    // Short (3 s): booking-ui without that switch (removed there) never sends this request.
+    for (const end = Date.now() + 3_000; Date.now() < end; ) {
+      if (this.api.myBookingsLoadedAt >= since || new URL(this.page.url()).pathname === "/my-bookings") break;
+      if (await loginShown.isVisible().catch(() => false)) break;
+      await this.page.waitForTimeout(200);
+    }
     await this.page.waitForTimeout(300); // the switch happens right after that response
     if (new URL(this.page.url()).pathname !== "/my-bookings") return;
     console.log("[teetime-e2e] the app opened My Booking (a booking later today); back to Book Now");

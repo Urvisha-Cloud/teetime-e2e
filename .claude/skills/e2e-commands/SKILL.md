@@ -24,23 +24,26 @@ It must always match `package.json` and the tests. Update it **in the same chang
 * **Run groups:** `| Command | What it runs | Real booking |` (no Chrome / visible column: every command is visible).
 * **Single tests:** `| TC | File | What it checks | Real booking |`, sorted by TC number (ranges like `TC1–5` are fine).
 * **Setup** and **Reports and debugging:** `| Command | What it does |`
-* Commands in backticks, exactly as the user types them (`npm run …`, or `npx playwright …` when there is no script).
+* Commands in backticks in the **`npx playwright test …` form** (the user asked for npx, not `npm run`): the exact
+  value of the matching `package.json` script with `npx ` in front. Escape `|` inside table cells as `\|`
+  (e.g. in `--grep "A\|B"`). The npm names stay in `package.json` as shortcuts; mention them only in the intro note.
 * Real booking column: `No`, `Yes`, `No (mocked)`, `Request only` (real create request, booking deleted again by the
   backend), or `(TC11's)` for steps that reuse another test's booking.
 
 ## Rules for new commands
 
-* Add a `package.json` script for anything run more than once, so the user can type `npm run <name>`.
+* Add a `package.json` script for anything run more than once (a shortcut: `npm run <name>`), and document its
+  `npx playwright test …` form in COMMANDS.md.
   Name it `test:<area>` (e.g. `test:payment`). **Every test script must include `--headed`** (or `--ui`): the user
   always watches the tests in a visible Chrome window.
 * Exception: the unattended daily run (`run-readonly.cmd`, Task Scheduler) calls `npx playwright test …` directly
   without `--headed`, so no window pops up. Don't point it at an npm script.
 * Never document `npm playwright …` — it is not valid. Use `npx playwright …` or an npm script.
-* Extra options go after `--`, only once: `npm run test:payment -- --debug`.
+* Extra options go at the end of the npx command: `npx playwright test tests/payment-negative.spec.ts --headed --debug`.
 
 ## Checking
 
-1. `npm run` — every script listed must appear in COMMANDS.md, and nothing else.
+1. `npm run` — every script's npx form must appear in COMMANDS.md, and nothing else.
 2. `npx playwright test --list` — every TC in the output must appear in **Single tests**; counts must match.
 3. For a new or changed script: `npx playwright test <same args> --list` selects the tests the table says.
 4. Also update the README "Run" and "Test cases" tables if they cover the same change.
