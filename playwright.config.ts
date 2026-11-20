@@ -81,7 +81,12 @@ export default defineConfig({
           use: {
             ...devices["Desktop Chrome"],
             channel: "chrome",
-            viewport: { width: 1440, height: 900 }, // >= 768px -> desktop booking Dialog
+            // Full screen: the window opens maximized and the page uses the whole window (desktop screens are
+            // >= 768px wide -> desktop booking Dialog). viewport null needs deviceScaleFactor / isMobile unset.
+            viewport: null,
+            deviceScaleFactor: undefined,
+            isMobile: undefined,
+            launchOptions: { args: ["--start-maximized"] },
             storageState: env.storageState,
           },
         },

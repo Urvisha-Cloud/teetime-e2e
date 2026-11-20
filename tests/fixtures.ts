@@ -1,4 +1,4 @@
-import { test as base, expect, type BrowserContext, type ConsoleMessage, type Request } from "@playwright/test";
+import { test as base, expect, type BrowserContext, type ConsoleMessage, type PlaywrightWorkerArgs, type Request } from "@playwright/test";
 import * as fs from "fs";
 import * as path from "path";
 import { BookingApp } from "../support/booking-app";
@@ -27,26 +27,39 @@ type WorkerFixtures = {
 
 export const test = base.extend<Fixtures, WorkerFixtures>({
   sharedContext: [
-    async ({ browser }, use, workerInfo) => {
+    async ({ browser, playwright, browserName, headless }, use, workerInfo) => {
       const projectUse = workerInfo.project.use;
       const signup = env.authMode === "signup";
-      const context = await browser.newContext({
+      // viewport null (Chrome project): full screen — the page fills the maximized window (playwright.config.ts)
+      const fullScreen = projectUse.viewport === null;
+      const options = {
         baseURL: env.baseURL,
-        // signup mode starts logged out; saved mode reuses the login from `npm run auth`
-        storageState: signup ? undefined : env.storageState,
         timezoneId: env.browserTz,
         locale: "en-US",
-        viewport: projectUse.viewport ?? { width: 1440, height: 900 },
+        viewport: fullScreen ? null : (projectUse.viewport ?? { width: 1440, height: 900 }),
         userAgent: projectUse.userAgent,
-        deviceScaleFactor: projectUse.deviceScaleFactor,
-      });
+        ...(fullScreen ? {} : { deviceScaleFactor: projectUse.deviceScaleFactor }),
+      };
+      // TEETIME_CHROME_PROFILE: the test window uses that Chrome profile (e.g. signed in to your Google account)
+      const context =
+        env.chromeProfile && browserName === "chromium"
+          ? await openChromeProfile(
+              playwright,
+              { ...options, channel: projectUse.channel, headless, args: projectUse.launchOptions?.args ?? [] },
+              signup,
+            )
+          : await browser.newContext({
+              ...options,
+              // signup mode starts logged out; saved mode reuses the login from `npm run auth`
+              storageState: signup ? undefined : env.storageState,
+            });
       // Visible cursor for every page in this window, before the first page opens (login included)
       if (env.showCursor) {
         await context.addInitScript(installCursor, { glideMs: CURSOR_GLIDE_MS, idleMs: env.readMs + 3000 });
       }
       context.setDefaultTimeout(projectUse.actionTimeout || 15_000);
       context.setDefaultNavigationTimeout(projectUse.navigationTimeout || 45_000);
-      const page = await context.newPage();
+      const page = context.pages()[0] ?? (await context.newPage()); // a Chrome profile window already has a tab
 
       if (signup) {
         // One test user, reused across runs (its email is remembered in .auth/e2e-user.json):
@@ -102,11 +115,12 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
             `(inbox: https://yopmail.com/?${email.split("@")[0]})`,
         );
         // Keep this run's login on disk for reference. A separate file, so the saved account from `npm run auth`
-        // (TEETIME_STORAGE_STATE, used by TEETIME_AUTH_MODE=saved) is never overwritten.
-        await context.storageState({ path: path.join(path.dirname(env.storageState), "last-signup-user.json") });
+        // (TEETIME_STORAGE_STATE, used by TEETIME_AUTH_MODE=saved) is never overwritten. Only the booking site's
+        // cookies and storage are written: with TEETIME_CHROME_PROFILE the window also holds your Google login.
+        const state = await appStorageState(context);
+        fs.writeFileSync(path.join(path.dirname(env.storageState), "last-signup-user.json"), JSON.stringify(state, null, 2));
         // For browsers restarted later in this run (see reuseRunSession). .auth/ is git-ignored.
-        const { cookies } = await context.storageState();
-        fs.writeFileSync(sessionFile, JSON.stringify({ runId: process.env.TEETIME_RUN_ID, email, cookies }));
+        fs.writeFileSync(sessionFile, JSON.stringify({ runId: process.env.TEETIME_RUN_ID, email, cookies: state.cookies }));
       }
 
       await use(context);
@@ -157,8 +171,10 @@ export { expect };
 function readSavedTestUser(file: string): string | null {
   try {
     const email = String(JSON.parse(fs.readFileSync(file, "utf8")).email ?? "").toLowerCase();
-    // Only reuse our own test addresses (the dev backend's fixed code only applies to them).
-    return email.startsWith(`${env.signup.emailPrefix}-`) && email.includes("@") ? email : null;
+    // Only reuse our own test addresses (the dev backend's fixed code only applies to them), on the configured
+    // TEETIME_SIGNUP_EMAIL_DOMAIN (yopmail.com): a user saved with another domain is replaced by a new one.
+    const ours = email.startsWith(`${env.signup.emailPrefix.toLowerCase()}-`);
+    return ours && email.endsWith(`@${env.signup.emailDomain.toLowerCase()}`) ? email : null;
   } catch {
     return null; // no file yet (first run) or unreadable -> sign up a new user
   }
@@ -181,7 +197,67 @@ async function reuseRunSession(app: BookingApp, context: BrowserContext, file: s
     await app.open(); // throws when the login popup shows (session no longer valid)
     return true;
   } catch {
-    await context.clearCookies();
+    await context.clearCookies({ domain: APP_COOKIE_DOMAIN }); // only the booking site's (keeps a Google login)
+    // The app also keeps its login in localStorage: clear that too, or the email-code login that follows finds
+    // the site still signed in (no login popup)
+    await app.page
+      .evaluate(() => {
+        localStorage.clear();
+        sessionStorage.clear();
+      })
+      .catch(() => {});
     return false;
   }
+}
+
+/** Cookies of the booking site and its API (e.g. dev-booking[-api].teetimeindoorgolf.com): the last two host labels. */
+const APP_ROOT_DOMAIN = new URL(env.baseURL).hostname.split(".").slice(-2).join(".");
+const APP_COOKIE_DOMAIN = new RegExp(`(^|[.])${APP_ROOT_DOMAIN.split(".").join("[.]")}$`, "i");
+const isAppHost = (host: string) => APP_COOKIE_DOMAIN.test(host.replace(/^\./, ""));
+
+/** The booking site's part of the window's storage state (its cookies and localStorage), nothing from other sites. */
+async function appStorageState(context: BrowserContext) {
+  const state = await context.storageState();
+  return {
+    cookies: state.cookies.filter((c) => isAppHost(c.domain)),
+    origins: state.origins.filter((o) => isAppHost(new URL(o.origin).hostname)),
+  };
+}
+
+/**
+ * TEETIME_CHROME_PROFILE: open the test window with that Chrome profile folder (persistent), so what you signed in to
+ * there with `npm run chrome:login` — e.g. your Google account — is signed in during the tests. Only the booking
+ * site's own login is reset first, so the test user logs in exactly as in a fresh window; nothing else in the
+ * profile is touched. Chrome must not already be open with this profile (the folder is locked while in use).
+ */
+async function openChromeProfile(
+  playwright: PlaywrightWorkerArgs["playwright"],
+  options: Record<string, unknown>,
+  signup: boolean,
+): Promise<BrowserContext> {
+  fs.mkdirSync(env.chromeProfile, { recursive: true });
+  let context: BrowserContext;
+  try {
+    context = await playwright.chromium.launchPersistentContext(env.chromeProfile, options);
+  } catch (e) {
+    throw new Error(
+      `[teetime-e2e] Could not open the Chrome profile ${env.chromeProfile} (TEETIME_CHROME_PROFILE). ` +
+        `Close every Chrome window that uses this profile and run again. ${(e as Error).message.split("\n")[0]}`,
+    );
+  }
+  console.log(`[teetime-e2e] test window uses the Chrome profile ${env.chromeProfile}`);
+  // Start the booking site logged out, like a fresh window: its cookies, localStorage and sessionStorage only
+  await context.clearCookies({ domain: APP_COOKIE_DOMAIN });
+  const page = context.pages()[0] ?? (await context.newPage());
+  await page.goto(env.baseURL);
+  await page.evaluate(() => {
+    localStorage.clear();
+    sessionStorage.clear();
+  });
+  // Saved mode: the login from `npm run auth` (a persistent profile cannot take a storageState file)
+  if (!signup && fs.existsSync(env.storageState)) {
+    const saved = JSON.parse(fs.readFileSync(env.storageState, "utf8"));
+    await context.addCookies((saved.cookies ?? []).filter((c: { domain: string }) => isAppHost(c.domain)));
+  }
+  return context;
 }

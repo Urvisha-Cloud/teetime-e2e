@@ -1,8 +1,11 @@
 import type { Locator, TestInfo } from "@playwright/test";
+import { spawn, type ChildProcess } from "child_process";
+import * as fs from "fs";
+import * as path from "path";
 import { BlockedError, BookingApp, annotateBlocked, type CreatedBooking, type SelectedBooking } from "../support/booking-app";
 import { bookingCreationBlockedReason, env } from "../support/env";
 import { addDays, compareDates, fromMinutes, headerLabel, isoDate, nowMinutesIn, pad12, slotRange, todayIn, toMinutes } from "../support/time";
-import { expect, test } from "./fixtures";
+import { expect, test, testUser } from "./fixtures";
 
 type StripeCard = Parameters<BookingApp["enterCard"]>[1];
 type ChangeKind = "reschedule" | "extend";
@@ -263,7 +266,9 @@ export async function bookSlot(
   const modal = await fillBookingModal(app, testInfo, sel, { groupSize });
   const bookingId = await app.confirmBooking(modal, { read: Math.min(1500, app.readMs) }); // arrow on Confirm, then click
   testInfo.annotations.push({ type: "bookingId", description: bookingId });
-  return { ...sel, bookingId, groupSize };
+  const booking = { ...sel, bookingId, groupSize };
+  await showBookingEmail(app, testInfo, booking, "confirmed"); // YopMail window on top: the booking email, then behind
+  return booking;
 }
 
 /**
@@ -392,6 +397,8 @@ export async function confirmChangeDetails(
   const confirm = details.getByRole("button", { name: /^Confirm/ });
   await clickAndExpectPatch(app, testInfo, confirm, kind, b.bookingId, { read: Math.min(1500, app.readMs) });
   await expectConfirmed(app, b);
+  // YopMail window on top: the reschedule / group-size / extend email, then behind the test browser
+  await showBookingEmail(app, testInfo, b, kind === "extend" ? "extended" : "rescheduled");
 }
 
 // ───────────────────────────── reschedule ─────────────────────────────
@@ -609,6 +616,7 @@ export async function cancelInUi(
 
   await expect(app.page.getByText("Booking cancelled")).toBeVisible();
   await expect(cancel).toBeHidden();
+  await showBookingEmail(app, testInfo, b, "cancelled"); // YopMail window on top: the cancellation email, then behind
 }
 
 /** The cancelled booking is gone: no longer active for the user, and its slots on the calendar are free again. */
@@ -754,4 +762,129 @@ export async function exerciseExtendControls(app: BookingApp, popup: Locator, ba
   await expectExtendSelection(popup, base, finalSlots);
   await app.readPause();
   return max;
+}
+
+// ───────────────────────────── booking email (YopMail) ─────────────────────────────
+
+/**
+ * How long each email is shown: about 8 s for the inbox to load (YopMail opens the newest email by itself) plus
+ * the time it stays visible on top, before the test browser comes back to the front.
+ */
+const YOPMAIL_LOAD_MS = 8_000;
+const YOPMAIL_SHOW_MS = 1_000;
+/**
+ * Wait this long after the booking change before opening the inbox. YopMail always opens the NEWEST email, and the
+ * test cannot pick another one in that window: opened too early, the newest is still the previous email (e.g. the
+ * "TeeTime Login Code" from the login), not the booking email. Raise it if an older email still shows.
+ */
+const YOPMAIL_ARRIVE_MS = 12_000;
+
+/** Which booking email the step after a change expects on top of the inbox (for the note and the console). */
+type EmailKind = "confirmed" | "rescheduled" | "group size" | "extended" | "cancelled";
+const EMAIL_SUBJECT: Record<EmailKind, string> = {
+  confirmed: "Your TeeTime booking is confirmed",
+  rescheduled: "Your TeeTime booking is rescheduled",
+  "group size": "booking updated (group size)",
+  extended: "booking extended",
+  cancelled: "booking cancelled",
+};
+
+/** Your installed Google Chrome app, or undefined when it is not found. */
+function chromeApp(): string | undefined {
+  const candidates =
+    process.platform === "win32"
+      ? [
+          path.join(process.env.PROGRAMFILES || "C:/Program Files", "Google", "Chrome", "Application", "chrome.exe"),
+          path.join(process.env["PROGRAMFILES(X86)"] || "C:/Program Files (x86)", "Google", "Chrome", "Application", "chrome.exe"),
+          path.join(process.env.LOCALAPPDATA || "", "Google", "Chrome", "Application", "chrome.exe"),
+        ]
+      : process.platform === "darwin"
+        ? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+        : ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"];
+  return candidates.find((p) => p && fs.existsSync(p));
+}
+
+/** The one YopMail window of this run (its Chrome process), kept open between the email steps. */
+let yopmailWindow: ChildProcess | undefined;
+
+/**
+ * Show the newest email of the test user's YopMail inbox (e.g. teetime-e2e-…@yopmail.com) in a separate, NORMAL
+ * Chrome window — not the test browser, where YopMail's Cloudflare check always fails.
+ *
+ * The YopMail window stays open for the whole run. Each call (after create, reschedule, group size, extend, cancel)
+ * opens the inbox again in that window (a new tab, so it shows the newest email), puts the window ON TOP of the
+ * test browser for the load time + 1 s, then moves it BEHIND the test browser and goes back to the booking site;
+ * the next case runs and the next call brings the YopMail window to the top again. Closed it yourself? The next
+ * call opens a new one. It stays open after the run; close it whenever you like.
+ *
+ * The window has its own small profile (.auth/yopmail-browser, git-ignored); the test never controls or reads the
+ * page, so it does not check the email. Never skips or fails the test it runs in: when it cannot run (background
+ * run, a test user that is not a YopMail address, no Chrome), it only adds a note.
+ */
+export async function showBookingEmail(app: BookingApp, testInfo: TestInfo, b: CreatedBooking, kind: EmailKind = "confirmed") {
+  const skip = (why: string) => testInfo.annotations.push({ type: "booking-email", description: `${EMAIL_SUBJECT[kind]}: not shown (${why})` });
+  const email = (testUser.email ?? env.testEmail).toLowerCase();
+  if (!email.endsWith("@yopmail.com")) return skip(`the test user ${email || "(none)"} is not a YopMail address`);
+  if (testInfo.project.use.headless !== false) return skip("visible runs only (--headed)");
+  const chrome = chromeApp();
+  if (!chrome) return skip("Google Chrome not found");
+
+  const profile = path.join(path.dirname(env.storageState), "yopmail-browser");
+  fs.mkdirSync(profile, { recursive: true });
+  const inbox = `https://yopmail.com/en/?login=${encodeURIComponent(email.split("@")[0])}`;
+  const look = `${b.startTime} – ${b.endTime}, ${b.bayName}`;
+  console.log(`[teetime-e2e] YopMail window on top: newest email should be "${EMAIL_SUBJECT[kind]}" (${look})`);
+
+  const args = [`--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--hide-crash-restore-bubble", inbox];
+  // Let the booking email arrive first, so it is the newest one YopMail opens (not the login code email)
+  await app.page.waitForTimeout(YOPMAIL_ARRIVE_MS);
+  if (!yopmailWindow) {
+    // First email of the run (or you closed the window): a new YopMail window
+    const started = spawn(chrome, ["--start-maximized", "--new-window", ...args], { stdio: "ignore" });
+    started.once("exit", () => {
+      if (yopmailWindow === started) yopmailWindow = undefined;
+    });
+    yopmailWindow = started;
+  } else {
+    // Window already open: the same Chrome opens the inbox in a new tab there (shows the newest email)
+    spawn(chrome, args, { stdio: "ignore" }).unref();
+  }
+
+  await moveWindow(yopmailWindow.pid, "top"); // in front of the test browser, which is not touched
+  await app.page.waitForTimeout(YOPMAIL_LOAD_MS + YOPMAIL_SHOW_MS);
+  await moveWindow(yopmailWindow?.pid, "behind"); // stays open, behind the test browser, until the next email
+  testInfo.annotations.push({ type: "booking-email", description: `${EMAIL_SUBJECT[kind]}: shown in YopMail (${inbox}; ${look})` });
+  await app.page.bringToFront(); // back to the booking site tab
+}
+
+/**
+ * Windows only: move the YopMail Chrome window (by its process id) to the top of every window ("top", always on
+ * top while shown; restored first if minimized) or behind all other windows ("behind", no longer on top), with
+ * user32 SetWindowPos. Waits until the window exists (up to 12 s). Nothing happens on other systems.
+ */
+async function moveWindow(pid: number | undefined, where: "top" | "behind") {
+  if (process.platform !== "win32" || !pid) return;
+  const action =
+    where === "top"
+      ? "if ($u::IsIconic($h)) { [void]$u::ShowWindow($h, 9) }; [void]$u::SetWindowPos($h, [IntPtr](-1), 0, 0, 0, 0, 0x43)"
+      : "[void]$u::SetWindowPos($h, [IntPtr](1), 0, 0, 0, 0, 0x13)";
+  const script = [
+    "$sig = @'",
+    '[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);',
+    '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);',
+    '[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);',
+    "'@",
+    "$u = Add-Type -MemberDefinition $sig -Name Win -Namespace TeeTimeE2E -PassThru",
+    "for ($i = 0; $i -lt 60; $i++) {",
+    `  $p = Get-Process -Id ${Number(pid)} -ErrorAction SilentlyContinue; if (-not $p) { break }`,
+    `  $h = $p.MainWindowHandle; if ($h -ne 0) { ${action}; break }`,
+    "  Start-Sleep -Milliseconds 200",
+    "}",
+  ].join("\n");
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  await new Promise<void>((resolve) => {
+    const ps = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], { stdio: "ignore", windowsHide: true });
+    ps.once("exit", () => resolve());
+    ps.once("error", () => resolve());
+  });
 }

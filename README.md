@@ -40,6 +40,9 @@ cleanup cancel call gets HTTP 404 and test bookings stay active.
 Login is **email + one-time code**. `npm run auth` stores the session (cookie `authToken` + localStorage) and later
 runs reuse it. Tests run in the installed **Google Chrome** app (`channel: "chrome"` in `playwright.config.ts`),
 opened with a fresh profile each run, so your everyday Chrome window and its login are not used or changed.
+To run the tests in a Chrome profile that stays signed in (e.g. to your Google account), set
+`TEETIME_CHROME_PROFILE=.auth/chrome-profile` in `.env`, run `npm run chrome:login` once, sign in in that Chrome window
+yourself and close it. Your everyday Chrome profile is still never used.
 
 **One window per run:** before the tests start, `support/global-setup.ts` checks the saved login in the background
 (no window). All tests then share **one** Chrome window (`sharedContext` in `tests/fixtures.ts`) that opens once and

@@ -62,6 +62,12 @@ export const env = {
     phone: str("TEETIME_SIGNUP_PHONE", "5555550123"), // the form requires exactly 10 digits
   },
   storageState: path.resolve(__dirname, "..", str("TEETIME_STORAGE_STATE", ".auth/staging-user.json")),
+  /**
+   * Optional Chrome profile folder for the test window (Chrome project only). Empty (default): a fresh, empty
+   * profile every run. Set (e.g. .auth/chrome-profile): the tests open Chrome with that profile, so whatever you
+   * signed in to there once with `npm run chrome:login` (e.g. your Google account) is already signed in.
+   */
+  chromeProfile: str("TEETIME_CHROME_PROFILE") ? path.resolve(__dirname, "..", str("TEETIME_CHROME_PROFILE")) : "",
 
   paymentMode: str("TEETIME_PAYMENT_MODE", "saved-card") as "saved-card" | "test-card",
   stripe: {

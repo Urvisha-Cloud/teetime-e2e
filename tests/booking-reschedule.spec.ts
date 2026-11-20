@@ -19,6 +19,7 @@ import {
   slotsAfterRequested,
   slotsBeforeRequested,
   startReschedule,
+  showBookingEmail,
 } from "./helper";
 import { expect, test } from "./fixtures";
 
@@ -143,7 +144,8 @@ for (const { minutes, label, first } of [
 
       // Booking Checkout ("Booking Confirmed") with the new time, then wait for the reschedule to settle
       await expectConfirmed(app, next);
-       await app.page.waitForTimeout(QUICK_SHIFT_SETTLE_MS);
+      await app.page.waitForTimeout(QUICK_SHIFT_SETTLE_MS);
+      await showBookingEmail(app, testInfo, next, "rescheduled"); // YopMail window on top: the shift email, then behind
     });
 
     test(`TC${first + 2}: View My Booking -> calendar shows the booking at the new time`, async () => {

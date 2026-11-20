@@ -19,6 +19,7 @@ Every command below is the `npx playwright test …` form. Each one also has a s
 | `npx playwright install chromium` | Install Playwright's browser files (tests themselves use your installed Google Chrome) |
 | `npx playwright install webkit` | Install Safari's engine (WebKit) for the `desktop-safari` project |
 | `npx playwright test --project=setup --headed` | Only for `TEETIME_AUTH_MODE=saved`: log in once as `TEETIME_TEST_EMAIL` and type the emailed code |
+| `node support/chrome-login.js` | (shortcut `npm run chrome:login`) Only with `TEETIME_CHROME_PROFILE` set: opens your normal Chrome with that test profile so you sign in yourself once (e.g. your Google account); close it afterwards. Later test runs open the test window with that profile, already signed in |
 | `npx tsc --noEmit` | Check the test code compiles (TypeScript) |
 
 ## Run groups of tests
@@ -167,6 +168,16 @@ Run any of these with `npx playwright test --headed -g "<TC>"`.
 ## Good to know
 
 * Stop a running test with **Ctrl+C** in the terminal. Don't close or click the test Chrome window during a run.
+* Test window: Chrome opens **maximized** and the page fills the whole window (Safari keeps 1440×900).
+* Booking emails (visible runs): after **every** booking is created, rescheduled / shifted 15 min, given more players,
+  extended or cancelled (refund cases too), a separate normal Chrome window with the test user's YopMail inbox moves on
+  top of the test browser, shows the newest email (it waits ~12 s first so the booking email has arrived and is
+  the newest, not the login-code email; then ~8 s to load + 1 s), then moves behind it and stays open for the next one. YopMail's Cloudflare check blocks the test browser itself, so that window is not test-controlled and the
+  emails are shown, not checked. Background runs and non-YopMail test users skip it (a note in the report).
+* Test window profile: empty by default (a fresh Chrome profile each run). With `TEETIME_CHROME_PROFILE=.auth/chrome-profile`
+  in `.env` and `npm run chrome:login` once, the test window opens with that profile, signed in to what you signed in to
+  there (e.g. your Google account). Only the booking site's login is reset at the start of a run. Close every Chrome
+  window using that profile before a run; Safari runs ignore the setting. Your everyday Chrome profile is never used.
 * Login: `TEETIME_AUTH_MODE=signup` (default) reuses one test user (`teetime-e2e-<time>@yopmail.com`, remembered in
   `.auth/e2e-user.json`): the first run signs it up, later runs log in with email + code `1111`; a deleted user is signed
   up again, a blocked one replaced. Delete `.auth/e2e-user.json` for a brand-new user; `saved` reuses the login from `npx playwright test --project=setup --headed`. Settings live in `.env`.
