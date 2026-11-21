@@ -4,7 +4,7 @@ import { addPlayers, bookFreeSlot, bookingSuite, bookSlot, cancelInUi, chooseNew
 import { expect, test, testUser } from "./fixtures";
 import { slotRange } from "../support/time";
 
-test.describe("Booking flow: login -> create -> reschedule -> group size -> extend -> cancel @creates-booking", () => {
+test.describe("Booking flow: login -> create -> reschedule -> group size -> extend -> cancel @main @creates-booking", () => {
   // Each step pauses to be read (TEETIME_READ_MS)
   let app: BookingApp;
   const suite = bookingSuite((a) => (app = a), { watch: true });

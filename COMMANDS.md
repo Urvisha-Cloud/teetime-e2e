@@ -9,41 +9,43 @@ Keep this file in sync with `package.json` and the tests: see `.claude/skills/e2
 *Real booking*: whether the run leaves a real booking on dev (it is cancelled at the end when `TEETIME_CLEANUP=true`).
 "Request only" = a real create request is sent, but the backend deletes the booking again (declined card).
 
-Every command below is the `npx playwright test …` form. Each one also has a short npm name in `package.json` (e.g. `npm test`, `npm run test:extend`) that runs exactly the same command.
+Every command below is shown both ways: the short **npm** name from `package.json` (e.g. `npm test`, `npm run test:extend`) and the same command in full with **npx** (`npx playwright test …`). Both run exactly the same thing; "—" means there is no npm shortcut for it.
 
 ## Setup (once)
 
-| Command | What it does |
-|---|---|
-| `npm ci` | Install the exact packages from `package-lock.json` (also fixes "playwright is not recognized") |
-| `npx playwright install chromium` | Install Playwright's browser files (tests themselves use your installed Google Chrome) |
-| `npx playwright install webkit` | Install Safari's engine (WebKit) for the `desktop-safari` project |
-| `npx playwright test --project=setup --headed` | Only for `TEETIME_AUTH_MODE=saved`: log in once as `TEETIME_TEST_EMAIL` and type the emailed code |
-| `node support/chrome-login.js` | (shortcut `npm run chrome:login`) Only with `TEETIME_CHROME_PROFILE` set: opens your normal Chrome with that test profile so you sign in yourself once (e.g. your Google account); close it afterwards. Later test runs open the test window with that profile, already signed in |
-| `npx tsc --noEmit` | Check the test code compiles (TypeScript) |
+| npm | npx (the same command in full) | What it does |
+|---|---|---|
+| `npm ci` | — | Install the exact packages from `package-lock.json` (also fixes "playwright is not recognized") |
+| — | `npx playwright install chromium` | Install Playwright's browser files (tests themselves use your installed Google Chrome) |
+| — | `npx playwright install webkit` | Install Safari's engine (WebKit) for the `desktop-safari` project |
+| `npm run auth` | `npx playwright test --project=setup --headed` | Only for `TEETIME_AUTH_MODE=saved`: log in once as `TEETIME_TEST_EMAIL` and type the emailed code |
+| `npm run chrome:login` | `node support/chrome-login.js` | Only with `TEETIME_CHROME_PROFILE` set: opens your normal Chrome with that test profile so you sign in yourself once (e.g. your Google account); close it afterwards. Later test runs open the test window with that profile, already signed in |
+| `npm run typecheck` | `npx tsc --noEmit` | Check the test code compiles (TypeScript) |
 
 ## Run groups of tests
 
-| Command | What it runs | Real booking |
-|---|---|---|
-| `npx playwright test tests/booking-flow.spec.ts tests/booking-reschedule.spec.ts tests/refund-cancel.spec.ts tests/switch-bay-extend.spec.ts --grep "Booking flow\|Quick shift\|50% refund\|no refund\|Extend to another bay" --headed` | **First, the booking flow on ONE booking** TC42–47: login → create → reschedule → group size → extend → **cancel: the refund policy is checked and applied** (90%). Then the two quick-shift scenarios TC48–53. Then two more cancel cases (`refund-cancel.spec.ts`): a booking starting 1–4 h from now → cancel → **tests/booking-flow.spec.ts tests/booking-reschedule.spec.ts tests/refund-cancel.spec.ts tests/switch-bay-extend.spec.ts --grep "Booking flow\|Quick shift\|50% refund\|no refund\|Extend to another bay"** (TC84–86), and one starting within 1 h → cancel → **no refund** (TC87–89); both check the popup, confirm the cancellation straight away, then check the refund the backend applied and that the booking is gone (each skips itself when no such time is free today). **Last, extend to another bay** (`switch-bay-extend.spec.ts`) TC100–102: a free 1-hour booking + another booking in the same bay 30 min after it → Extend → +30 min (the limit) → **Switch bay, keep playing** → pick a bay in the dropdown → 1 hr → Continue → Booking Details → the new session on that bay is booked; then the same on an Impact Vision booking with the green promo **Switch to Trackman** → pick a Trackman bay → 1 hr → Continue → Booking Details → booked (TC103–105). Chrome closes and the command ends when all steps are done | 11 (TC43, TC84, TC87 cancelled by their own tests; TC48, TC51, TC100–102 and TC103–105 kept) |
-| `npx playwright test tests/booking-flow.spec.ts tests/booking-reschedule.spec.ts tests/refund-cancel.spec.ts tests/switch-bay-extend.spec.ts --grep "Booking flow\|Quick shift\|50% refund\|no refund\|Extend to another bay" --headed --project=desktop-chromium` | The main run (first row), Google Chrome only | Same as the main run |
-| `npx playwright test tests/booking-flow.spec.ts tests/booking-reschedule.spec.ts tests/refund-cancel.spec.ts tests/switch-bay-extend.spec.ts --grep "Booking flow\|Quick shift\|50% refund\|no refund\|Extend to another bay" --headed --project=desktop-safari` | The main run (first row), Safari (WebKit) only | Same as the main run |
-| `npx playwright test --headed` | Everything (103 tests) | 5 (TC11, TC27, TC35, TC38, TC43) + request only (TC20–24) |
-| `npx playwright test --grep-invert @creates-booking --headed` | Everything except `@creates-booking` | No |
-| `npx playwright test --grep @creates-booking --headed` | Only `@creates-booking`: journey TC11–14, declined cards TC20–24, reschedule + group size TC27–34, quick shift TC48–53, cancel TC35–37, extend TC38–41 + TC54–57, full flow TC42–47 | 5 (TC11, TC27, TC35, TC38, TC43) + request only |
-| `npx playwright test tests/booking-create.spec.ts --headed` | Booking journey TC11–14: sign up → book → confirmation screen → View My Booking → calendar | 1 (TC11) |
-| `npx playwright test tests/booking-flow.spec.ts --headed` | **Full flow on ONE booking, step by step** TC42–47: login → create (8–9 PM, 1 player) → reschedule (9–11 PM, same group size) → update group size (5) → extend (+30 min, to 11:30 PM) → cancel → calendar free | 1 (TC43, cancelled by TC47) |
-| `npx playwright test tests/booking-reschedule-rules.spec.ts --headed` | Reschedule rules TC62–80 (customer side), a fresh booking per group: only once · leave without changing (Back, X, Cancel, closed details, other bays disabled, shorter time refused, group size max) · to another date · within 4 hours · conflicts with another booking · API error + double-click · declined card | 6–7 (one per group, B extra in conflicts) |
-| `npx playwright test tests/booking-reschedule.spec.ts --headed` | Every reschedule case: reschedule + group size TC27–34 (book → ⋮ → Reschedule → new time → Confirm Changes → Reschedule details → Booking Confirmed → calendar, then ⋮ → Update Group Size → Add players → Reschedule details → Booking Confirmed → calendar), then quick shift TC48–53, one booking each (⋮ → **15 min earlier** / **15 min later** → "Reschedule booking" shows Current and New time → Confirm changes → Booking Confirmed with the new time (waits 10 s) → View My Booking → calendar shows the new time) | 3 (TC27, TC48, TC51; cancelled afterwards) |
-| `npx playwright test tests/booking-cancel.spec.ts tests/refund-cancel.spec.ts --headed` | Cancel TC35–37 and the refund cases TC81–89 (90% / 50% / no refund: policy list, refund amount, cancel, refund applied) | 4 (TC35, TC81, TC84, TC87; each cancelled by its own test) |
-| `npx playwright test tests/booking-extend.spec.ts tests/switch-bay-extend.spec.ts --headed` | Every extend case, one booking each: TC38–41 book → ⋮ → Manage your booking → Extend Booking → `TEETIME_EXTEND_BY` (+30 min) → Continue → Extend details (waiver, pay) → Confirm → Booking Confirmed → View My Booking → calendar shows the longer booking; TC54–57 popup controls "+" / "−", presets +30 min / +1 hr / +2 hr / +3 hr, slider drag — label, slider and "Ends …" always agree, min 15 min / max 3 hr ("Ends 12:00 AM" past midnight) → +45 min → Continue → Extend details → Booking Confirmed → calendar → My Booking (+ TC58–61: time after taken → book a new session instead; TC90–99 more extend cases; TC100–102 Switch bay and TC103–105 Switch to Trackman from `switch-bay-extend.spec.ts`) | 2 (TC38, TC54; cancelled afterwards) |
-| `npx playwright test tests/group-sizes.spec.ts --headed` | Group sizes 1–5 (TC1–5) | No |
-| `npx playwright test tests/booking-negative.spec.ts tests/payment-negative.spec.ts --headed` | All negative cases TC15–25 (12 tests) | Request only (TC20–24) |
-| `npx playwright test tests/payment-negative.spec.ts --headed` | Payment errors TC18–25 | Request only (TC20–24) |
-| `npx playwright test -g "TC25" --headed` | TC25 only | No |
-| `npx playwright test --headed -g "TC21"` | Any one test by its number or a word from its title | Depends on the test |
-| `npx playwright test --ui` | Visual runner: pick tests in a window and watch them run | Depends on what you run |
+| npm | npx (the same command in full) | What it runs | Real booking |
+|---|---|---|---|
+| `npm test` | `npx playwright test --grep @main --headed` | **First, the booking flow on ONE booking** TC42–47: login → create → reschedule → group size → extend → **cancel: the refund policy is checked and applied** (90%). Then the two quick-shift scenarios TC48–53. Then two more cancel cases (`refund-cancel.spec.ts`): a booking starting 1–4 h from now → cancel → **50% refund** (TC84–86), and one starting within 1 h → cancel → **no refund** (TC87–89); both check the popup, confirm the cancellation straight away, then check the refund the backend applied and that the booking is gone (each skips itself when no such time is free today). **Last, extend to another bay** (`switch-bay-extend.spec.ts`) TC100–102: a free 1-hour booking + another booking in the same bay 30 min after it → Extend → +30 min (the limit) → **Switch bay, keep playing** → pick a bay in the dropdown → 1 hr → Continue → Booking Details → the new session on that bay is booked; then the same on an Impact Vision booking with the green promo **Switch to Trackman** → pick a Trackman bay → 1 hr → Continue → Booking Details → booked (TC103–105). **Last, gift card at checkout** (`z-gift-card.spec.ts`) TC111–115: Booking Details → a popup asks you for the gift card code (empty field: you type it) → "Have a gift card?" → the code → book → calendar → reschedule (+1 hr, same code again) → cancel (popup "Skip" skips them). Every group is tagged `@main` in the tests, so `--grep @main` picks exactly these. Chrome closes and the command ends when all steps are done | 11 (TC43, TC84, TC87, TC112 cancelled by their own tests; TC48, TC51, TC100–102 and TC103–105 kept) |
+| `npm run test:chrome` | `npx playwright test --grep @main --headed --project=desktop-chromium` | The main run (first row), Google Chrome only | Same as the main run |
+| `npm run test:safari` | `npx playwright test --grep @main --headed --project=desktop-safari` | The main run (first row), Safari (WebKit) only | Same as the main run |
+| `npm run test:all` / `npm run test:headed` | `npx playwright test --headed` | Everything (111 tests) | 5 (TC11, TC27, TC35, TC38, TC43) + request only (TC20–24) |
+| `npm run test:readonly` | `npx playwright test --grep-invert @creates-booking --headed` | Everything except `@creates-booking` | No |
+| `npm run test:booking` | `npx playwright test --grep @creates-booking --headed` | Only `@creates-booking`: journey TC11–14, declined cards TC20–24, reschedule + group size TC27–34, quick shift TC48–53, cancel TC35–37, extend TC38–41 + TC54–57, full flow TC42–47 | 5 (TC11, TC27, TC35, TC38, TC43) + request only |
+| `npm run test:create` | `npx playwright test tests/booking-create.spec.ts --headed` | Booking journey TC11–14: sign up → book → confirmation screen → View My Booking → calendar | 1 (TC11) |
+| `npm run test:flow` | `npx playwright test tests/booking-flow.spec.ts --headed` | **Full flow on ONE booking, step by step** TC42–47: login → create (8–9 PM, 1 player) → reschedule (9–11 PM, same group size) → update group size (5) → extend (+30 min, to 11:30 PM) → cancel → calendar free | 1 (TC43, cancelled by TC47) |
+| `npm run test:reschedule-rules` | `npx playwright test tests/booking-reschedule-rules.spec.ts --headed` | Reschedule rules TC62–80 (customer side), a fresh booking per group: only once · leave without changing (Back, X, Cancel, closed details, other bays disabled, shorter time refused, group size max) · to another date · within 4 hours · conflicts with another booking · API error + double-click · declined card | 6–7 (one per group, B extra in conflicts) |
+| `npm run test:reschedule` | `npx playwright test tests/booking-reschedule.spec.ts --headed` | Every reschedule case: reschedule + group size TC27–34 (book → ⋮ → Reschedule → new time → Confirm Changes → Reschedule details → Booking Confirmed → calendar, then ⋮ → Update Group Size → Add players → Reschedule details → Booking Confirmed → calendar), then quick shift TC48–53, one booking each (⋮ → **15 min earlier** / **15 min later** → "Reschedule booking" shows Current and New time → Confirm changes → Booking Confirmed with the new time (waits 10 s) → View My Booking → calendar shows the new time) | 3 (TC27, TC48, TC51; cancelled afterwards) |
+| `npm run test:cancel` | `npx playwright test tests/booking-cancel.spec.ts tests/refund-cancel.spec.ts --headed` | Cancel TC35–37 and the refund cases TC81–89 (90% / 50% / no refund: policy list, refund amount, cancel, refund applied) | 4 (TC35, TC81, TC84, TC87; each cancelled by its own test) |
+| `npm run test:wallet` | `npx playwright test tests/booking-wallet.spec.ts --headed` | Wallet TC107–110: empty wallet → My Wallet → Redeem Gift → popup: you type the gift card code (headless: `TEETIME_GIFT_CARD_CODE`) → Redeem → balance up; then book → Booking Details asks for the wallet balance → wallet credit if there is some ("Wallet credits", You pay = price − credit, card for the rest), otherwise the card pays it all → Booking Confirmed → saved wallet / card amounts → wallet balance afterwards | 1 (TC108; cancelled afterwards) |
+| `npm run test:gift-card` | `npx playwright test tests/z-gift-card.spec.ts --headed` | Gift card at checkout TC111–115 (runs last in every run: the file sorts last), as the run's logged-in test user → Booking Details → a popup asks you for the gift card code (e.g. from admin; empty field: you type it) → "Apply this code" → "Have a gift card?" → the code typed → Apply → the card pays the rest → Booking Confirmed, paymentBreakdown gift card + card → calendar → reschedule to its time + 1 hr → cancel (refund checked) → slots free. Skipped when you press "Skip" in the popup (headless: without `TEETIME_GIFT_CARD_CODE`). When the user's wallet credit covers the 1-hr booking (Booking Details then hides "Have a gift card?"), TC112 books enough hours (up to 8) that something is left for the gift card | 1 (TC112; cancelled by TC115) |
+| `npm run test:extend` | `npx playwright test tests/booking-extend.spec.ts tests/switch-bay-extend.spec.ts --headed` | Every extend case, one booking each: TC38–41 book → ⋮ → Manage your booking → Extend Booking → `TEETIME_EXTEND_BY` (+30 min) → Continue → Extend details (waiver, pay) → Confirm → Booking Confirmed → View My Booking → calendar shows the longer booking; TC54–57 popup controls "+" / "−", presets +30 min / +1 hr / +2 hr / +3 hr, slider drag — label, slider and "Ends …" always agree, min 15 min / max 3 hr ("Ends 12:00 AM" past midnight) → +45 min → Continue → Extend details → Booking Confirmed → calendar → My Booking (+ TC58–61: time after taken → book a new session instead; TC90–99 more extend cases; TC100–102 Switch bay and TC103–105 Switch to Trackman from `switch-bay-extend.spec.ts`) | 2 (TC38, TC54; cancelled afterwards) |
+| `npm run test:group-sizes` | `npx playwright test tests/group-sizes.spec.ts --headed` | Group sizes 1–5 (TC1–5) | No |
+| `npm run test:negative` | `npx playwright test tests/booking-negative.spec.ts tests/payment-negative.spec.ts --headed` | All negative cases TC15–25 (12 tests) | Request only (TC20–24) |
+| `npm run test:payment` | `npx playwright test tests/payment-negative.spec.ts --headed` | Payment errors TC18–25 | Request only (TC20–24) |
+| `npm run test:no-group-size` | `npx playwright test -g "TC25" --headed` | TC25 only | No |
+| `npm run test:one -- "TC21"` | `npx playwright test --headed -g "TC21"` | Any one test by its number or a word from its title | Depends on the test |
+| `npm run test:ui` | `npx playwright test --ui` | Visual runner: pick tests in a window and watch them run | Depends on what you run |
 
 **Reading speed (the main run):** the flow pauses about 1 s on every modal (manage menu, How to reschedule, the selected time, Reschedule booking, the details with a slow scroll through the price, extend time, group size, cancel refund) so you can follow it. Change it with `TEETIME_READ_MS` in `.env` (e.g. `3000` to read longer; `0` = full speed).
 
@@ -54,7 +56,7 @@ Add options at the end, e.g. `npx playwright test tests/payment-negative.spec.ts
 
 ## Single tests
 
-Run any of these with `npx playwright test --headed -g "<TC>"`.
+Run any of these with `npm run test:one -- "<TC>"` (or in full: `npx playwright test --headed -g "<TC>"`).
 
 | TC | File | What it checks | Real booking |
 |---|---|---|---|
@@ -156,24 +158,34 @@ Run any of these with `npx playwright test --headed -g "<TC>"`.
 | TC103 | `switch-bay-extend.spec.ts` | Switch to Trackman — book a free hour on an **Impact Vision** bay (from the bays' technology), then another booking in the same bay starting 30 min after it (skipped if the location has no Impact Vision or no Trackman bay) | 2 |
 | TC104 | `switch-bay-extend.spec.ts` | Extend → +30 min (the limit) → green promo "Want to keep playing? … Trackman bay(s) … free right after your session" → **Switch to Trackman** → subtitle "Switch to Trackman · Bay N" → Bay dropdown: pick a Trackman bay (the 2nd when several) → 1 hr → preview → Continue → Booking Details for that bay (skipped if no Trackman bay is free for that hour) | (TC103's) |
 | TC105 | `switch-bay-extend.spec.ts` | Booking Details → group size, waiver, payment → Confirm → Booking Confirmed on the Trackman bay; the first booking and the blocker are unchanged | Yes |
+| TC107 | `booking-wallet.spec.ts` | Only when the wallet is empty: sidebar "My Wallet" → "Redeem Gift" → "Redeem gift card" modal → popup: you type the gift card code (headless: `TEETIME_GIFT_CARD_CODE`) → typed into "Gift code" → Redeem → wallet balance goes up (shown on My Wallet) → back to "Book Your Bay". Wallet already has credit → nothing to redeem; "Skip" or a refused code → TC108 pays by card | No |
+| TC108 | `booking-wallet.spec.ts` | Book a free slot: opening Booking Details makes the app call `GET /wallet/balance` → credit: "Wallet credits" line, "You pay" = price − credit, card for the rest; no credit: no wallet line, card pays it all → waiver → Confirm → Booking Confirmed | Yes |
+| TC109 | `booking-wallet.spec.ts` | Saved booking (`paymentBreakdown`): walletAmount = the credit used, cardAmount = the rest | (TC108's) |
+| TC110 | `booking-wallet.spec.ts` | Wallet afterwards: balance = before − credit used (unchanged without credit); the wallet history has a debit for this booking of the credit used (none when the card paid it all) | (TC108's) |
+| TC111 | `z-gift-card.spec.ts` | The run's logged-in test user (no other user): notes its wallet credit, which the app applies before a gift card; when it covers the 1-hr booking, TC112 books longer (enough hours that something is left to pay, up to 8) | No |
+| TC112 | `z-gift-card.spec.ts` | Booking Details → popup: you type the gift card code (the field starts empty; headless runs use `TEETIME_GIFT_CARD_CODE` instead) → "Have a gift card?" → the code typed → Apply → "Gift Card Applied", lower "You pay" (booking time left as selected) → waiver → card for the rest, if any → Confirm → Booking Confirmed; `paymentBreakdown` wallet + gift card + card match | Yes |
+| TC113 | `z-gift-card.spec.ts` | View My Booking → the gift-card booking is on the calendar | (TC112's) |
+| TC114 | `z-gift-card.spec.ts` | Reschedule the gift-card booking to its own time + 1 hr more (same start, same bay) → Reschedule details → "Have a gift card?" → the same code pays the difference (card the rest) → Booking Confirmed → saved gift card total = booking + difference → calendar shows it up to the new end | (TC112's) |
+| TC115 | `z-gift-card.spec.ts` | Cancel it: the cancel popup shows the policy and the refund → Confirm cancellation → refund applied → "Booking cancelled" → its slots free again | Cancels TC112's |
 
 ## Reports and debugging
 
-| Command | What it does |
-|---|---|
-| `npx playwright show-report` | Open the last HTML report (screenshots and traces of failures) |
-| `npx playwright show-trace test-results/<folder>/trace.zip` | Step through one failed test |
-| `npx playwright test -g "TC1:" --debug` | Run one test step by step in the Playwright inspector |
+| npm | npx (the same command in full) | What it does |
+|---|---|---|
+| `npm run report` | `npx playwright show-report` | Open the last HTML report (screenshots and traces of failures) |
+| — | `npx playwright show-trace test-results/<folder>/trace.zip` | Step through one failed test |
+| — | `npx playwright test -g "TC1:" --debug` | Run one test step by step in the Playwright inspector |
 
 ## Good to know
 
 * Stop a running test with **Ctrl+C** in the terminal. Don't close or click the test Chrome window during a run.
 * Test window: Chrome opens **maximized** and the page fills the whole window (Safari keeps 1440×900).
-* Booking emails (visible runs): after **every** booking is created, rescheduled / shifted 15 min, given more players,
-  extended or cancelled (refund cases too), a separate normal Chrome window with the test user's YopMail inbox moves on
-  top of the test browser, shows the newest email (it waits ~12 s first so the booking email has arrived and is
-  the newest, not the login-code email; then ~8 s to load + 1 s), then moves behind it and stays open for the next one. YopMail's Cloudflare check blocks the test browser itself, so that window is not test-controlled and the
-  emails are shown, not checked. Background runs and non-YopMail test users skip it (a note in the report).
+* Booking emails (visible runs): after every booking is created, rescheduled / shifted 15 min, given more players,
+  extended or cancelled: checkout screen → `TEETIME_EMAIL_ARRIVE_MS` (default 1 s) → a separate normal Chrome window
+  with the test user's YopMail inbox moves on top and shows the newest email (~4 s to load + 1 s) → it moves behind
+  the test browser (and stays open for the next one) → the next step. If YopMail still shows the previous email, the
+  new one had not arrived yet: raise `TEETIME_EMAIL_ARRIVE_MS` (e.g. 10000). YopMail's Cloudflare check blocks the
+  test browser itself, so the emails are shown, not checked.
 * Test window profile: empty by default (a fresh Chrome profile each run). With `TEETIME_CHROME_PROFILE=.auth/chrome-profile`
   in `.env` and `npm run chrome:login` once, the test window opens with that profile, signed in to what you signed in to
   there (e.g. your Google account). Only the booking site's login is reset at the start of a run. Close every Chrome

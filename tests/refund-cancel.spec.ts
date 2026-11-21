@@ -30,7 +30,7 @@ const REFUND_CASES: {
 
 REFUND_CASES.forEach((c, i) => {
   const first = 81 + i * 3; // TC81–83, TC84–86, TC87–89, …
-  test.describe(`Cancel — ${c.name} @creates-booking`, () => {
+  test.describe(`Cancel — ${c.name}${c.percent < 90 ? " @main" : ""} @creates-booking`, () => {
     let app: BookingApp;
     const suite = bookingSuite((a) => (app = a), { watch: true });
     let booking: CreatedBooking | undefined;

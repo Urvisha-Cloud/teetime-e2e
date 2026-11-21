@@ -42,6 +42,25 @@ export interface CreatedBooking extends SelectedBooking {
 /** Thrown when the scenario cannot be executed because staging data does not allow it (not a product failure). */
 export class BlockedError extends Error {}
 
+/** Pages whose booking calendar was just loaded by the login step and not touched since (see markCalendarFresh). */
+const freshCalendar = new WeakSet<Page>();
+
+/**
+ * The login step (tests/fixtures.ts) has just loaded the booking calendar in `page`: the first BookingApp.open()
+ * uses it as it is instead of loading it a second time. Any navigation in the page (also inside the app) ends that,
+ * so a later open() reloads as usual.
+ */
+export function markCalendarFresh(page: Page) {
+  if (new URL(page.url()).pathname !== "/book-now") return;
+  freshCalendar.add(page);
+  const ended = (frame: unknown) => {
+    if (frame !== page.mainFrame()) return;
+    freshCalendar.delete(page);
+    page.off("framenavigated", ended);
+  };
+  page.on("framenavigated", ended);
+}
+
 /**
  * Page object for the real booking UI (MonthStyleCalendarView + CalenderHeader + CalenderGrid + BookingModal).
  * Selectors are taken from the shipped source: data-slot / data-screen grid attributes, accessible
@@ -73,6 +92,12 @@ export class BookingApp {
   // ───────────────────────────── navigation / auth ─────────────────────────────
 
   async open() {
+    // Right after the login step the calendar is already freshly loaded: use it, no second load
+    if (freshCalendar.has(this.page) && new URL(this.page.url()).pathname === "/book-now") {
+      freshCalendar.delete(this.page);
+      await this.openIfNeeded();
+      return;
+    }
     const since = Date.now();
     await this.page.goto("/book-now");
     await this.stayOnBookNow(since);
@@ -180,7 +205,19 @@ export class BookingApp {
     const grid = this.page.locator('[data-slot="0"]').first();
     const pickLocation = this.page.getByRole("heading", { name: "Select a Location" });
     const login = this.page.locator("input#email");
-    await expect(grid.or(pickLocation).or(login)).toBeVisible({ timeout: 45_000 });
+    // The app can switch to My Booking on its own (e.g. a session in progress today), also later than stayOnBookNow
+    // waits for: then go back to the calendar with the sidebar's "Book Your Bay" (a reload would only switch again)
+    const myBookings = this.page.getByRole("heading", { name: "My Booking", exact: true });
+    for (let attempt = 0; ; attempt++) {
+      await expect(grid.or(pickLocation).or(login).or(myBookings)).toBeVisible({ timeout: 45_000 });
+      if (attempt < 2 && new URL(this.page.url()).pathname === "/my-bookings" && !(await grid.isVisible())) {
+        console.log("[teetime-e2e] the app opened My Booking; back to Book Now");
+        await this.guidedClick(this.page.getByText("Book Your Bay", { exact: true }).first());
+        await expect(this.page).toHaveURL(/\/book-now/);
+        continue;
+      }
+      break;
+    }
     if (await login.isVisible()) {
       throw new Error("Not authenticated: login popup shown. Run `npm run auth` to refresh the stored session.");
     }
@@ -381,8 +418,16 @@ export class BookingApp {
 
   /** Server-side cross-check using the bookings the calendar itself loaded. */
   serverConflicts(bayId: string, date: LocalDate, startTime: string, endTime: string): any[] {
-    const list = this.api.lastBookingList ?? [];
     const { startIdx, endIdx } = slotRange(startTime, endTime);
+    return this.slotConflicts(bayId, date, startIdx, endIdx);
+  }
+
+  /**
+   * Bookings in the app's own list (GET /booking/get-every) that overlap slots startIdx..endIdx of `date` in a bay,
+   * compared in UTC — so slots past midnight (idx ≥ 96) and bookings that started the day before both count.
+   */
+  slotConflicts(bayId: string, date: LocalDate, startIdx: number, endIdx: number): any[] {
+    const list = this.api.lastBookingList ?? [];
     const startMs = zonedToUtcMs(date, startIdx * 15, this.tz);
     const endMs = zonedToUtcMs(date, (endIdx + 1) * 15, this.tz);
     return list.filter((b: any) => {
@@ -410,7 +455,10 @@ export class BookingApp {
         b.free &&
         !excludeBayIds.includes(b.bayId) &&
         (!extra || extra.find((x) => x.bayId === b.bayId)?.free) &&
-        this.serverConflicts(b.bayId, date, env.slotStart, env.slotEnd).length === 0,
+        this.serverConflicts(b.bayId, date, env.slotStart, env.slotEnd).length === 0 &&
+        // The extra range against the app's booking list too: the grid of a day does not show the part after
+        // midnight of a booking that started the evening before, but the app refuses to book over it
+        (!alsoFree || this.slotConflicts(b.bayId, date, alsoFree.startIdx, alsoFree.endIdx).length === 0),
     );
     if (!candidate) {
       const state = (b: BaySlotState) => {
@@ -779,6 +827,21 @@ export class BookingApp {
   }
 
   /** GET /booking/:id with the user's session: the booking as the API has it (times, paymentBreakdown, …). */
+  /** The signed-in user's wallet balance in dollars (GET /wallet/balance, the call the My Wallet page makes). */
+  async walletBalance(): Promise<number> {
+    const { status, body } = await this.authedFetch(`${env.apiURL}/wallet/balance`);
+    expect(status, "GET /wallet/balance").toBe(200);
+    return Number(unwrap<any>(body)?.balance ?? 0);
+  }
+
+  /** The wallet's transaction history, newest first (GET /wallet/transactions). */
+  async walletTransactions(): Promise<any[]> {
+    const { status, body } = await this.authedFetch(`${env.apiURL}/wallet/transactions`);
+    expect(status, "GET /wallet/transactions").toBe(200);
+    const list = unwrap<any>(body)?.transactions;
+    return Array.isArray(list) ? list : [];
+  }
+
   async fetchBooking(bookingId: string): Promise<any> {
     const { status, body } = await this.authedFetch(`${env.apiURL}/booking/${bookingId}`);
     expect(status, `GET /booking/${bookingId}`).toBe(200);

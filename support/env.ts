@@ -18,10 +18,6 @@ export const env = {
   /** Length of the test booking, and of the reschedule time (which starts right where the booking ends). */
   bookingMinutes: 60,
   rescheduleMinutes: 120,
-  /**
-   * Booking time in use — not configured. selectRequestedSlot (tests/helper.ts) finds the first free time at the
-   * location and fills these in; every later step (reschedule, extend, quick shift) reads them. Empty until then.
-   */
   slotStart: "",
   slotEnd: "",
   rescheduleStart: "",
@@ -33,10 +29,6 @@ export const env = {
   /** New group size for the group-size update test (players can only be added: must be > rescheduleGroupSize, max 5). */
   groupSizeUpdate: Number(str("TEETIME_GROUP_SIZE_UPDATE", "5")) || 5,
   daysAhead: Number(str("TEETIME_DAYS_AHEAD", "0")),
-  /**
-   * A booking found TODAY must start at least this many minutes from now: the app blocks rescheduling within 4 hours
-   * of the start (and the 15-min shift within 5 min), so the later steps would be impossible otherwise.
-   */
   minLeadMinutes: Number(str("TEETIME_MIN_LEAD_MINUTES", "270")),
   browserTz: str("TEETIME_BROWSER_TZ", "Pacific/Honolulu"),
   groupSizes: str("TEETIME_GROUP_SIZES", "1,2,3,4,5")
@@ -45,14 +37,9 @@ export const env = {
     .filter((n) => Number.isInteger(n) && n >= 1 && n <= 5),
 
   testEmail: str("TEETIME_TEST_EMAIL"),
+  giftCardCode: str("TEETIME_GIFT_CARD_CODE"),
   testOtp: str("TEETIME_TEST_OTP"),
 
-  /**
-   * How the run logs in:
-   *  - "signup" (default): sign up a brand-new user every run (unique yopmail address, signup form, code TEETIME_TEST_OTP)
-   *    in the shared Chrome window before the tests. Needs TEST_OTP set on the dev backend.
-   *  - "saved": reuse the login saved by `npm run auth` (TEETIME_STORAGE_STATE).
-   */
   authMode: (str("TEETIME_AUTH_MODE", "signup") === "saved" ? "saved" : "signup") as "signup" | "saved",
   signup: {
     emailPrefix: str("TEETIME_SIGNUP_EMAIL_PREFIX", "teetime-e2e"),
@@ -62,11 +49,6 @@ export const env = {
     phone: str("TEETIME_SIGNUP_PHONE", "5555550123"), // the form requires exactly 10 digits
   },
   storageState: path.resolve(__dirname, "..", str("TEETIME_STORAGE_STATE", ".auth/staging-user.json")),
-  /**
-   * Optional Chrome profile folder for the test window (Chrome project only). Empty (default): a fresh, empty
-   * profile every run. Set (e.g. .auth/chrome-profile): the tests open Chrome with that profile, so whatever you
-   * signed in to there once with `npm run chrome:login` (e.g. your Google account) is already signed in.
-   */
   chromeProfile: str("TEETIME_CHROME_PROFILE") ? path.resolve(__dirname, "..", str("TEETIME_CHROME_PROFILE")) : "",
 
   paymentMode: str("TEETIME_PAYMENT_MODE", "saved-card") as "saved-card" | "test-card",
@@ -79,6 +61,7 @@ export const env = {
   cleanup: str("TEETIME_CLEANUP") === "true",
   /** How long the journey test keeps the confirmation screen and the booked calendar on screen (ms). */
   showMs: Number(str("TEETIME_SHOW_MS", "3000")) || 0,
+  emailArriveMs: Number(str("TEETIME_EMAIL_ARRIVE_MS", "1000")),
   /** Watching a headed run: pause on each modal so it can be read (booking-flow.spec.ts). 0 = no pauses. */
   readMs: Number(str("TEETIME_READ_MS", "1000")) || 0,
   /** Draw a visible mouse cursor (arrow + click pulse) in the test browser; Playwright's window shows none. */

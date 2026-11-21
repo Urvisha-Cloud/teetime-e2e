@@ -1,7 +1,7 @@
 import { test as base, expect, type BrowserContext, type ConsoleMessage, type PlaywrightWorkerArgs, type Request } from "@playwright/test";
 import * as fs from "fs";
 import * as path from "path";
-import { BookingApp } from "../support/booking-app";
+import { BookingApp, markCalendarFresh } from "../support/booking-app";
 import { env } from "../support/env";
 import { CURSOR_GLIDE_MS, installCursor } from "../support/cursor";
 
@@ -30,15 +30,17 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
     async ({ browser, playwright, browserName, headless }, use, workerInfo) => {
       const projectUse = workerInfo.project.use;
       const signup = env.authMode === "signup";
-      // viewport null (Chrome project): full screen — the page fills the maximized window (playwright.config.ts)
-      const fullScreen = projectUse.viewport === null;
+      // viewport null (Chrome project): full screen — the page fills the maximized window (playwright.config.ts).
+      // Visible runs only: a background run (no --headed) has no screen to fill, and its small default window would
+      // switch the site to the mobile layout, so it keeps the fixed 1440×900 page.
+      const fullScreen = projectUse.viewport === null && headless === false;
       const options = {
         baseURL: env.baseURL,
         timezoneId: env.browserTz,
         locale: "en-US",
         viewport: fullScreen ? null : (projectUse.viewport ?? { width: 1440, height: 900 }),
         userAgent: projectUse.userAgent,
-        ...(fullScreen ? {} : { deviceScaleFactor: projectUse.deviceScaleFactor }),
+        ...(fullScreen ? {} : { deviceScaleFactor: projectUse.deviceScaleFactor ?? 1 }),
       };
       // TEETIME_CHROME_PROFILE: the test window uses that Chrome profile (e.g. signed in to your Google account)
       const context =
@@ -92,6 +94,7 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
           testUser.email = saved;
           testUser.result = "login";
           console.log(`[teetime-e2e] reused the saved login for ${saved}: calendar opened directly, no login popup`);
+          markCalendarFresh(page); // the first test uses this calendar instead of loading it again
           await use(context);
           await context.close();
           return;
@@ -121,6 +124,7 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
         fs.writeFileSync(path.join(path.dirname(env.storageState), "last-signup-user.json"), JSON.stringify(state, null, 2));
         // For browsers restarted later in this run (see reuseRunSession). .auth/ is git-ignored.
         fs.writeFileSync(sessionFile, JSON.stringify({ runId: process.env.TEETIME_RUN_ID, email, cookies: state.cookies }));
+        markCalendarFresh(page); // the login ends on the calendar: the first test uses it instead of loading it again
       }
 
       await use(context);
@@ -249,11 +253,12 @@ async function openChromeProfile(
   // Start the booking site logged out, like a fresh window: its cookies, localStorage and sessionStorage only
   await context.clearCookies({ domain: APP_COOKIE_DOMAIN });
   const page = context.pages()[0] ?? (await context.newPage());
-  await page.goto(env.baseURL);
-  await page.evaluate(() => {
-    localStorage.clear();
-    sessionStorage.clear();
-  });
+  // Without opening the site (that would load the calendar once more for nothing): clear its stored data directly
+  const cdp = await context.newCDPSession(page);
+  await cdp
+    .send("Storage.clearDataForOrigin", { origin: new URL(env.baseURL).origin, storageTypes: "local_storage,session_storage" })
+    .catch(() => {});
+  await cdp.detach().catch(() => {});
   // Saved mode: the login from `npm run auth` (a persistent profile cannot take a storageState file)
   if (!signup && fs.existsSync(env.storageState)) {
     const saved = JSON.parse(fs.readFileSync(env.storageState, "utf8"));

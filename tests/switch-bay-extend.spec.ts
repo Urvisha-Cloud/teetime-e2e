@@ -99,11 +99,18 @@ async function pickBayAndContinue(
   await app.guidedClick(bayDropdown, { read: app.readMs });
   const options = app.page.getByRole("option");
   await expect(options.first()).toBeVisible();
-  const names = (await options.allInnerTexts()).map((t) => t.split("·")[0].trim());
-  testInfo.annotations.push({ type: "bay-options", description: names.join(", ") });
-  const choice = names[names.length > 1 ? 1 : 0];
+  const texts = (await options.allInnerTexts()).map((t) => t.replace(/\s+/g, " ").trim());
+  const names = texts.map((t) => t.split("·")[0].trim());
+  testInfo.annotations.push({ type: "bay-options", description: texts.join(" | ") });
+  // The dropdown can also list bays that are not free for the whole hour (e.g. booked part of it), so pick one that
+  // is in the dropdown AND free on the calendar — the 2nd such bay when there are several, so the choice changes
+  const usable = names.filter((n) => freeBays.some((b) => b.bayName === n));
+  expect(
+    usable.length,
+    `the dropdown (${names.join(", ")}) offers a bay free for the hour from ${f.endTime} (${freeBays.map((b) => b.bayName).join(", ")})`,
+  ).toBeGreaterThan(0);
+  const choice = usable[usable.length > 1 ? 1 : 0];
   const bay = freeBays.find((b) => b.bayName === choice);
-  expect(bay, `"${choice}" from the dropdown is one of the bays free from ${f.endTime}`).toBeTruthy();
   await app.guidedClick(options.filter({ hasText: choice }).first(), { read: app.readMs });
   await expect(bayDropdown).toContainText(choice);
   await expect(picked, "subtitle names the chosen bay").toContainText(`${option} · ${choice}`);
@@ -161,7 +168,7 @@ async function bookNewSession(app: BookingApp, testInfo: TestInfo, next: Selecte
 
 // ───────────────────────────── Switch bay, keep playing ─────────────────────────────
 
-test.describe("Extend to another bay: Switch bay, keep playing @creates-booking", () => {
+test.describe("Extend to another bay: Switch bay, keep playing @main @creates-booking", () => {
   let app: BookingApp;
   const suite = bookingSuite((a) => (app = a), { watch: true });
   let first: CreatedBooking | undefined; // the booking we try to extend
@@ -197,7 +204,7 @@ test.describe("Extend to another bay: Switch bay, keep playing @creates-booking"
 
 // ───────────────────────────── Switch to Trackman ─────────────────────────────
 
-test.describe("Extend to another bay: Switch to Trackman @creates-booking", () => {
+test.describe("Extend to another bay: Switch to Trackman @main @creates-booking", () => {
   let app: BookingApp;
   const suite = bookingSuite((a) => (app = a), { watch: true });
   let trackmanIds: string[] = [];

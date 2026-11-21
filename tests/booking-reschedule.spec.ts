@@ -99,7 +99,7 @@ for (const { minutes, label, first } of [
   { minutes: -15, label: "15 min earlier", first: 48 },
   { minutes: 15, label: "15 min later", first: 51 },
 ] as const) {
-  test.describe(`Quick shift: ${label} @creates-booking`, () => {
+  test.describe(`Quick shift: ${label} @main @creates-booking`, () => {
     let app: BookingApp;
     const suite = bookingSuite((a) => (app = a), { watch: true });
     let original: CreatedBooking | undefined;
@@ -142,10 +142,11 @@ for (const { minutes, label, first } of [
       await clickAndExpectPatch(app, testInfo, confirm.getByRole("button", { name: "Confirm Changes" }), "reschedule", b.bookingId);
       shifted = next;
 
-      // Booking Checkout ("Booking Confirmed") with the new time, then wait for the reschedule to settle
-      await expectConfirmed(app, next);
+      // Booking Checkout ("Booking Confirmed") with the new time -> straight to the shift email in YopMail (on top,
+      // then behind) -> a short wait for the reschedule to settle before the next case
+      await expectConfirmed(app, next, { pause: false });
+      await showBookingEmail(app, testInfo, next, "rescheduled");
       await app.page.waitForTimeout(QUICK_SHIFT_SETTLE_MS);
-      await showBookingEmail(app, testInfo, next, "rescheduled"); // YopMail window on top: the shift email, then behind
     });
 
     test(`TC${first + 2}: View My Booking -> calendar shows the booking at the new time`, async () => {
