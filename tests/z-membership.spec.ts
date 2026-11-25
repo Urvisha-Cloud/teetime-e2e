@@ -508,7 +508,7 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @m
       elite = await app.membership();
     }
 
-    // Elite in the API, on the Membership page and in the sidebar
+    // Elite in the API and on the Membership page (the open sidebar no longer shows the member card)
     expect(Number(elite.plan.price), "Elite price").toBe(299);
     expect(Number(elite.plan.monthlyCredit), "Elite monthly credit").toBe(550);
     expect(Number(elite.plan.discountPercent), "Elite discount").toBe(15);
@@ -519,7 +519,7 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @m
     await expect(page.getByText("Active", { exact: true }).first(), 'the "Active" badge').toBeVisible();
     await expect(page.getByText("/ $550", { exact: true }).first(), "the monthly credit").toBeVisible();
     await expect(page.getByText(`$${Number(elite.creditBalance).toFixed(2)}`, { exact: true }).first(), "the credit balance").toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText("Elite member", { exact: true }).first(), "the sidebar").toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText("Elite", { exact: true }).first(), "the plan name").toBeVisible();
     await app.readPause();
   });
 
