@@ -734,11 +734,6 @@ export class BookingApp {
     return String(body.bookingId);
   }
 
-  /**
-   * Step 8 — pages/BookingCheckout.tsx. It is a confirmation screen (payment already processed during Confirm),
-   * not a payment form. It shows: "Booking Confirmed", email, date, hh:mm A - hh:mm A, location, bay(+type),
-   * "N Persons"/"1 Player", "Add to Google Calendar", "View My Booking".
-   */
   async verifyCheckout(created: CreatedBooking) {
     const page = this.page;
     // Persistence: the screen itself fetches GET /booking/:id from the backend. The recorder keeps that response, so
@@ -825,13 +820,18 @@ export class BookingApp {
       await expect(this.cell(created.bayId, s)).not.toHaveClass(/hover:bg-gray-100/);
     }
   }
-
-  /** GET /booking/:id with the user's session: the booking as the API has it (times, paymentBreakdown, …). */
-  /** The signed-in user's wallet balance in dollars (GET /wallet/balance, the call the My Wallet page makes). */
   async walletBalance(): Promise<number> {
     const { status, body } = await this.authedFetch(`${env.apiURL}/wallet/balance`);
     expect(status, "GET /wallet/balance").toBe(200);
     return Number(unwrap<any>(body)?.balance ?? 0);
+  }
+
+
+  async membership(): Promise<any | null> {
+    const { status, body } = await this.authedFetch(`${env.apiURL}/membership/me`);
+    expect(status, "GET /membership/me").toBe(200);
+    const data = unwrap<any>(body);
+    return data && typeof data === "object" && data.status ? data : null;
   }
 
   /** The wallet's transaction history, newest first (GET /wallet/transactions). */

@@ -4,7 +4,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { BlockedError, BookingApp, annotateBlocked, type CreatedBooking, type SelectedBooking } from "../support/booking-app";
 import { bookingCreationBlockedReason, env } from "../support/env";
-import { addDays, compareDates, fromMinutes, headerLabel, isoDate, nowMinutesIn, pad12, slotRange, todayIn, toMinutes } from "../support/time";
+import { type LocalDate, addDays, compareDates, fromMinutes, headerLabel, isoDate, nowMinutesIn, pad12, slotRange, todayIn, toMinutes } from "../support/time";
 import { expect, test, testUser } from "./fixtures";
 
 type StripeCard = Parameters<BookingApp["enterCard"]>[1];
@@ -132,24 +132,19 @@ export async function selectRequestedSlot(
     todayWindow,
     rescheduleRoom = true,
     latestFirst = false,
+    dayWindow,
+    onlyDate,
+    skipDay,
   }: {
     reuseOpenPage?: boolean;
-    /**
-     * No bay free for the requested time on the date: click the calendar's › arrow and check up to this many
-     * following days (default 7, for every test). 0 = only the target date. Stops early if the app blocks the date.
-     */
     tryNextDays?: number;
-    /** The chosen bay must also be free here, relative to the booking start (slotsAfterRequested, rescheduleSlotsRange …). */
     alsoFree?: RelativeSlots;
-    /**
-     * Book TODAY with a start between `min` and `max` minutes from now (e.g. inside the 4-hour no-reschedule window).
-     * Replaces TEETIME_MIN_LEAD_MINUTES; use with tryNextDays: 0.
-     */
     todayWindow?: { min: number; max: number };
-    /** false: no room is kept for the reschedule time after the booking (tests that never reschedule). */
     rescheduleRoom?: boolean;
-    /** Pick the latest free time of the day instead of the earliest (e.g. to extend past midnight). */
     latestFirst?: boolean;
+    dayWindow?: { from: number; to: number };
+    onlyDate?: LocalDate;
+    skipDay?: (date: LocalDate) => string | null | undefined | false;
   } = {},
 ): Promise<SelectedBooking> {
   return orBlocked(testInfo, async () => {
@@ -162,7 +157,8 @@ export async function selectRequestedSlot(
       await app.selectLocation(env.locationName);
       await app.verifyLocationData(env.locationName);
     });
-    let date = app.targetDate();
+    let date = onlyDate ?? app.targetDate();
+    if (onlyDate) tryNextDays = 0;
     await test.step(`Go to booking date (+${env.daysAhead} day)`, async () => {
       await app.goToDate(date);
     });
@@ -178,7 +174,9 @@ export async function selectRequestedSlot(
     return test.step("Find the first free time and pick its bay", async () => {
       for (let day = 0; ; day++) {
         // The earliest time of the day where a bay is free for the booking and everything the test needs after it
-        let found: Awaited<ReturnType<typeof freeBay>> = new BlockedError(`no start time fits on ${isoDate(date)}`);
+        // A day the test cannot use (skipDay gives the reason) is passed over without looking at its times
+        const skipReason = skipDay?.(date) || null;
+        let found: Awaited<ReturnType<typeof freeBay>> = new BlockedError(skipReason ? `${isoDate(date)}: ${skipReason}` : `no start time fits on ${isoDate(date)}`);
         // Only starts at least TEETIME_MIN_LEAD_MINUTES from now (reschedule is blocked within 4 hours of the start).
         // Counted across midnight: at 10 PM, tomorrow's first allowed start is 2:30 AM, not 12:00 AM.
         const daysFromToday = Math.round(compareDates(date, todayIn(app.tz)) / 86_400_000);
@@ -188,8 +186,9 @@ export async function selectRequestedSlot(
           ? now + (todayWindow ? todayWindow.min : env.minLeadMinutes)
           : nowMinutesIn(app.tz) + env.minLeadMinutes - daysFromToday * 24 * 60; // <= 0 from the 2nd day on: any time
         const latest = isToday && todayWindow ? now + todayWindow.max : Infinity;
-        for (const start of startSlots(alsoFree, { rescheduleRoom, latestFirst })) {
+        for (const start of skipReason ? [] : startSlots(alsoFree, { rescheduleRoom, latestFirst })) {
           if (start * 15 < earliest || start * 15 > latest) continue;
+          if (dayWindow && (start * 15 < dayWindow.from || (start + bookingSlots()) * 15 > dayWindow.to)) continue;
           found = await freeBay(start);
           if (!(found instanceof BlockedError)) break;
         }
@@ -208,7 +207,10 @@ export async function selectRequestedSlot(
         const blocked = found;
         // 3. nothing free that day: next day via the calendar's › button (goToDate stops if the app blocks the date)
         if (day >= tryNextDays) throw blocked;
-        console.log(`[teetime-e2e] no free time on ${isoDate(date)} at ${env.locationName}; trying the next day`);
+        if (skipReason) testInfo.annotations.push({ type: "date", description: `skipped ${isoDate(date)}: ${skipReason}` });
+        console.log(
+          `[teetime-e2e] ${skipReason ? `skipping ${isoDate(date)} (${skipReason})` : `no free time on ${isoDate(date)} at ${env.locationName}`}; trying the next day`,
+        );
         date = addDays(date, 1);
         await app.goToDate(date);
       }
