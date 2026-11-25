@@ -8,10 +8,16 @@ import {
   cancelInUi,
   chooseNewTime,
   confirmChangeDetails,
+  continueExtend,
+  dueBeforeWallet,
+  ensureEmptyWallet,
   endTimeOption,
   expectBookingGone,
   expectConfirmed,
+  openExtendPopup,
   orBlocked,
+  outsideCreditHours,
+  presetSlots,
   requireBookingCreation,
   selectRequestedSlot,
   showBookingEmail,
@@ -21,11 +27,12 @@ import {
 import { expect, test } from "./fixtures";
 
 /**
- * Test cases 111–115 — pay a booking with a gift card at checkout ("Have a gift card?" in Booking Details), then
- * reschedule it and cancel it.
- * The file name starts with "z-" so Playwright runs it LAST, after every other case (files run in name order).
+ * Test cases 111–115 and 137 — pay a booking with a gift card at checkout ("Have a gift card?" in Booking Details), then
+ * reschedule, extend and cancel it.
+ * The file name starts with "y-": it runs after the card and wallet cases, before z-membership (files run in name order).
  *
- *  TC111  the run's test user (the one already logged in; no other user): notes its wallet credit. The app applies
+ *  TC111  the run's test user (the one already logged in; no other user): a wallet with credit must be emptied in admin first
+ *         (popup, the test goes on at $0; headless: the credit is only noted). The app applies
  *         wallet credit first — when it covers the 1-hr booking, "You pay" is $0 and Booking Details hides
  *         "Have a gift card?", so TC112 books longer (see below).
  *  TC112  book a free slot (1 hr; when the wallet covers that: End Time in the same Booking Details -> enough hours
@@ -39,9 +46,10 @@ import { expect, test } from "./fixtures";
  *  TC114  reschedule it to its own time + 1 hr more (same start, same bay) -> Reschedule details: the same gift card code
  *         (from the popup) pays the difference ("Have a gift card?"), the card the rest
  *         -> Booking Confirmed -> calendar shows it up to the new end
+ *  TC137  extend it (TEETIME_EXTEND_BY): the same code pays the extra time, the card the rest (or all, once it is used up)
  *  TC115  cancel it -> the cancel popup's refund -> Confirm cancellation -> refund applied -> its slots free again
  *
- * Popup "Skip" (or no code within 5 min) -> TC112–115 are skipped. Headless runs show no popup: they use
+ * Popup "Skip" (or no code within 5 min) -> TC112–115 and TC137 are skipped. Headless runs show no popup: they use
  * TEETIME_GIFT_CARD_CODE, and are skipped without it. The booking is cancelled afterwards (TEETIME_CLEANUP=true).
  */
 
@@ -51,14 +59,6 @@ const RESCHEDULE_EXTRA_HOURS = 1;
 /** Longest booking TC112 makes so that something is left to pay after the wallet credit. */
 const MAX_BOOKING_HOURS = 8;
 
-/** The session price before the gift card: "Session price after discounts" (or "Session price" without discounts). */
-function sessionPrice(modalText: string): number {
-  const m =
-    modalText.match(/Session price after discounts\s*\$(\d+(?:,\d{3})*\.\d{2})/) ?? modalText.match(/Session price\s*\$(\d+(?:,\d{3})*\.\d{2})/);
-  if (!m) throw new Error(`No session price in Booking Details: ${modalText.slice(0, 300)}`);
-  return Number(m[1].replace(/,/g, ""));
-}
-
 test.describe("Gift card at checkout @main @creates-booking", () => {
   let app: BookingApp;
   const suite = bookingSuite((a) => (app = a), { watch: true });
@@ -67,6 +67,8 @@ test.describe("Gift card at checkout @main @creates-booking", () => {
   let walletBefore = 0; // the test user's wallet credit, applied before the gift card
   let booking: CreatedBooking | undefined;
   let rescheduled = false;
+  let extended = false;
+  const extraSlots = presetSlots(env.extendBy);
   let giftPaid = 0; // what the gift card paid at booking (TC112)
 
   test("TC111: the logged-in test user is ready for the gift card (wallet credit noted)", async ({ headless }, testInfo) => {
@@ -74,6 +76,8 @@ test.describe("Gift card at checkout @main @creates-booking", () => {
     // Headed: you enter the code in a popup (TC112). Headless nobody can, so the code must be in .env
     test.skip(headless && !env.giftCardCode, "Headless run without a gift card code: set TEETIME_GIFT_CARD_CODE in .env (or run --headed)");
     await app.openIfNeeded(); // the run's own login: the calendar is already open
+    // Credit left by the wallet cases (x-wallet) would pay instead: a popup asks you to empty it in admin
+    if (!headless) await ensureEmptyWallet(app, testInfo, "gift card");
     walletBefore = await app.walletBalance();
     testInfo.annotations.push({ type: "wallet", description: `$${walletBefore.toFixed(2)} (applied before the gift card)` });
     if (walletBefore > 0) console.log(`[teetime-e2e] gift card: the test user's wallet has $${walletBefore.toFixed(2)}, applied first`);
@@ -87,7 +91,10 @@ test.describe("Gift card at checkout @main @creates-booking", () => {
     // the bay must then be free for up to MAX_BOOKING_HOURS; it must always be free RESCHEDULE_EXTRA_HOURS more after
     // the booking, for the longer reschedule (TC114)
     const roomAfter = (walletBefore > 0 ? MAX_BOOKING_HOURS - 1 : 0) + RESCHEDULE_EXTRA_HOURS;
-    let sel = await selectRequestedSlot(app, testInfo, [], { alsoFree: slotsAfterRequested(roomAfter * 4) });
+    let sel = await selectRequestedSlot(app, testInfo, [], {
+      alsoFree: slotsAfterRequested(roomAfter * 4 + extraSlots), // and the extension (TC137)
+      ...(await outsideCreditHours(app)), // a member's credit would pay it instead
+    });
     const modal = await app.openBookingModal(sel);
     await app.readPause();
     await app.selectGroupSize(modal, 1);
@@ -96,7 +103,7 @@ test.describe("Gift card at checkout @main @creates-booking", () => {
       // The wallet credit (applied first) covers the whole booking, so Booking Details hides "Have a gift card?":
       // End Time -> enough hours that something is left after the wallet, for the gift card
       const hoursNow = (sel.endIdx + 1 - sel.startIdx) / 4;
-      const perHour = sessionPrice(await modal.innerText()) / hoursNow;
+      const perHour = dueBeforeWallet(await modal.innerText()) / hoursNow;
       const hours = Math.floor(walletBefore / perHour) + 1;
       test.skip(
         !(perHour > 0) || hours > MAX_BOOKING_HOURS,
@@ -126,10 +133,17 @@ test.describe("Gift card at checkout @main @creates-booking", () => {
     giftCode = headless ? env.giftCardCode : await askGiftCode(app, testInfo, modal);
     test.skip(!giftCode, "No gift card code entered in the popup");
 
-    // "Have a gift card?" -> the code -> Apply ("You pay" goes down; a refused code skips with the app's reason)
-    const { after } = await applyGiftCode(app, testInfo, modal, giftCode);
+    // "Have a gift card?" -> the code -> Apply ("You pay" goes down). A refused code (used up, already redeemed, …): the
+    // popup asks for another one; the 3rd refused code (headless: the 1st) skips with the app's reason
+    const tries = headless ? 1 : 3;
+    let { after } = await applyGiftCode(app, testInfo, modal, giftCode, { onRefused: tries > 1 ? "continue" : "skip" });
+    for (let attempt = 2; after >= before && attempt <= tries; attempt++) {
+      giftCode = await askGiftCode(app, testInfo, modal);
+      test.skip(!giftCode, "The gift card code was refused and no other code was entered in the popup");
+      ({ after } = await applyGiftCode(app, testInfo, modal, giftCode, { onRefused: attempt < tries ? "continue" : "skip" }));
+    }
     // The booking time stays as selected (no End Time change): straight on to the waiver and Confirm
-    const price = sessionPrice(await modal.innerText());
+    const price = dueBeforeWallet(await modal.innerText());
     // The wallet's credit is applied first, then the gift card, then the card pays what is left
     const walletPart = round2(Math.min(walletBefore, price));
     const giftPart = round2(price - walletPart - after);
@@ -200,8 +214,25 @@ test.describe("Gift card at checkout @main @creates-booking", () => {
     await app.viewMyBooking(booking); // every slot from the start to the new end belongs to the booking
   });
 
-  test("TC115: cancel the gift-card booking -> refund shown and applied -> its slots free again", async ({}, testInfo) => {
+  test(`TC137: extend the gift-card booking -> ${env.extendBy} -> the gift card pays, the card the rest -> calendar`, async ({}, testInfo) => {
     test.skip(!rescheduled, "TC114 did not reschedule the booking");
+    const gifts = async () =>
+      ((await app.fetchBooking(booking!.bookingId))?.paymentBreakdown?.giftCards ?? []).reduce((sum: number, g: any) => sum + Number(g.amount || 0), 0);
+    const before = await gifts();
+    const popup = await openExtendPopup(app, booking!);
+    await app.guidedClick(popup.getByRole("button", { name: env.extendBy, exact: true }));
+    const next = await continueExtend(app, popup, booking!, extraSlots);
+    const gift = await confirmChangeDetails(app, testInfo, "extend", next, { giftCode }); // the code entered in TC112
+    booking = next;
+    extended = true;
+    const giftNow = round2(gift ? gift.before - gift.after : 0);
+    testInfo.annotations.push({ type: "extend-payment", description: `gift card $${giftNow.toFixed(2)}, card $${(gift?.after ?? 0).toFixed(2)}` });
+    expect(round2((await gifts()) - before), "the gift card paid what Extend details showed").toBeCloseTo(giftNow, 2);
+    await app.viewMyBooking(booking);
+  });
+
+  test("TC115: cancel the gift-card booking -> refund shown and applied -> its slots free again", async ({}, testInfo) => {
+    test.skip(!extended, "TC137 did not extend the booking");
     await cancelInUi(app, testInfo, booking!, { checkRefund: true }); // policy, refund amount (gift card + card), applied
     suite.markCancelled();
     await expectBookingGone(app, booking!);

@@ -1,20 +1,33 @@
+import type { TestInfo } from "@playwright/test";
 import type { BookingApp, CreatedBooking } from "../support/booking-app";
 import { env } from "../support/env";
 import { unwrap } from "../support/network";
 import {
   GIFT_CODE_KEY_DELAY_MS,
+  addPlayers,
   askGiftCode,
   bookingSuite,
+  cancelInUi,
+  chooseNewTime,
+  confirmChangeDetails,
+  continueExtend,
+  dueBeforeWallet,
+  expectBookingGone,
   expectConfirmed,
+  openExtendPopup,
   orBlocked,
+  outsideCreditHours,
+  presetSlots,
   requireBookingCreation,
+  rescheduleSlotsRange,
   selectRequestedSlot,
   showBookingEmail,
+  startReschedule,
 } from "./helper";
 import { expect, test, testUser } from "./fixtures";
 
 /**
- * Test cases 107–110 — a booking paid with the wallet credit when there is some, otherwise by card. Wallet credit is
+ * Test cases 107–110 and 133–136 — a booking paid with the wallet credit when there is some, otherwise by card. Wallet credit is
  * applied by itself (My Wallet: "Credits auto-apply on your next booking"; Booking Details has no switch for it).
  *
  *  TC107  only when the wallet is empty: sidebar "My Wallet" -> "Redeem Gift" -> the "Redeem gift card" modal -> a popup
@@ -30,28 +43,28 @@ import { expect, test, testUser } from "./fixtures";
  *  TC110  the wallet afterwards: balance = before − credit used (unchanged when none was used), and the wallet's
  *         history has a debit for THIS booking of the credit used (none when the card paid it all)
  *
- * The booking is cancelled afterwards (TEETIME_CLEANUP=true).
+ *  TC133–136  the same booking: reschedule -> group size -> extend -> cancel; every extra cost is paid by the wallet
+ *         first, then the card; the cancellation puts the wallet's part (less the fee) back
+ *
+ * File name "x-…": runs after every card-paid case (files run in name order), so the refund of this booking cannot
+ * reach them; y-gift-card and z-membership follow.
  */
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 /** The account the run is logged in as (the wallet belongs to it). */
 const testUserEmail = () => testUser.email ?? env.testEmail ?? "the test user";
 
-/** The session price before the wallet: "Session price after discounts" (or "Session price" without discounts). */
-function sessionPrice(modalText: string): number {
-  const m =
-    modalText.match(/Session price after discounts\s*\$(\d+(?:,\d{3})*\.\d{2})/) ?? modalText.match(/Session price\s*\$(\d+(?:,\d{3})*\.\d{2})/);
-  if (!m) throw new Error(`No session price in Booking Details: ${modalText.slice(0, 300)}`);
-  return Number(m[1].replace(/,/g, ""));
-}
-
-test.describe("Wallet credit, otherwise card @creates-booking", () => {
+test.describe("Wallet credit, otherwise card: create -> reschedule -> group size -> extend -> cancel @main @creates-booking", () => {
   let app: BookingApp;
   const suite = bookingSuite((a) => (app = a), { watch: true });
   let balanceBefore = 0; // what GET /wallet/balance said when Booking Details opened
   let used = 0; // wallet credit the booking uses
   let cardPart = 0; // what the card pays
-  let booking: CreatedBooking | undefined;
+  let booking: CreatedBooking | undefined; // as it is after the latest step
+  let rescheduled = false;
+  let resized = false;
+  let extended = false;
+  const extraSlots = presetSlots(env.extendBy);
 
   test("TC107: empty wallet -> My Wallet -> Redeem Gift -> popup: enter the gift card code -> Redeem -> wallet balance goes up", async ({ headless }, testInfo) => {
     requireBookingCreation();
@@ -114,7 +127,12 @@ test.describe("Wallet credit, otherwise card @creates-booking", () => {
 
   test("TC108: Booking Details checks the wallet balance -> wallet credit if there is some, otherwise card -> Booking Confirmed", async ({}, testInfo) => {
     requireBookingCreation();
-    const sel = await selectRequestedSlot(app, testInfo);
+    await app.openIfNeeded();
+    const sel = await selectRequestedSlot(app, testInfo, [], {
+      // the same bay must be free for the reschedule and the extension (TC133, TC135); outside member credit hours
+      alsoFree: rescheduleSlotsRange(extraSlots),
+      ...(await outsideCreditHours(app)),
+    });
 
     // Opening Booking Details makes the app ask for the wallet balance (GET /wallet/balance)
     const walletCall = app.page
@@ -133,7 +151,7 @@ test.describe("Wallet credit, otherwise card @creates-booking", () => {
     await app.selectGroupSize(modal, 1);
 
     // Wallet credit first, the card for the rest — or the card for everything when there is no credit
-    const price = sessionPrice(await modal.innerText());
+    const price = dueBeforeWallet(await modal.innerText());
     used = round2(Math.min(Math.max(balanceBefore, 0), price));
     cardPart = round2(price - used);
     testInfo.annotations.push({
@@ -183,5 +201,83 @@ test.describe("Wallet credit, otherwise card @creates-booking", () => {
     } else {
       expect(forBooking.length, "no wallet entry for a booking paid by card only").toBe(0);
     }
+  });
+
+  /**
+   * Runs a change (reschedule / group size / extend) of the wallet booking and checks how its extra cost was paid: the
+   * wallet first, as far as it goes, the card the rest — and the wallet went down by exactly its part.
+   */
+  async function changePaidByWallet(testInfo: TestInfo, what: string, change: () => Promise<CreatedBooking>) {
+    const paid = async () => {
+      const p = (await app.fetchBooking(booking!.bookingId))?.paymentBreakdown ?? {};
+      return { wallet: Number(p.walletAmount || 0), card: Number(p.cardAmount || 0) };
+    };
+    const wallet = await app.walletBalance();
+    const before = await paid();
+    booking = await change();
+    const after = await paid();
+    const fromWallet = round2(after.wallet - before.wallet);
+    const fromCard = round2(after.card - before.card);
+    const note = `${what}: wallet $${fromWallet.toFixed(2)} + card $${fromCard.toFixed(2)} (wallet had $${wallet.toFixed(2)})`;
+    testInfo.annotations.push({ type: "payment", description: note });
+    console.log(`[teetime-e2e] wallet: ${note}`);
+    expect(fromWallet, `${what}: the wallet pays first, as far as it goes`).toBeCloseTo(Math.min(wallet, round2(fromWallet + fromCard)), 2);
+    await expect
+      .poll(async () => round2(await app.walletBalance()), { message: `${what}: wallet balance down by what it paid`, timeout: 20_000 })
+      .toBe(round2(wallet - fromWallet));
+    await app.viewMyBooking(booking);
+  }
+
+  test("TC133: reschedule the wallet booking -> the 2 hr after it -> wallet credit pays the difference, the card the rest -> calendar", async ({}, testInfo) => {
+    test.skip(!booking, "TC108 did not create the booking");
+    await app.viewMyBooking(booking!); // TC108 left the Booking Confirmed screen open
+    await changePaidByWallet(testInfo, "reschedule", async () => {
+      await startReschedule(app, booking!);
+      const next = await chooseNewTime(app, booking!, env.rescheduleStart, env.rescheduleEnd);
+      await confirmChangeDetails(app, testInfo, "reschedule", next, { pickGroupSize: true });
+      return next;
+    });
+    rescheduled = true;
+  });
+
+  test(`TC134: update the group size of the wallet booking -> ${env.groupSizeUpdate} players -> calendar`, async ({}, testInfo) => {
+    test.skip(!rescheduled, "TC133 did not reschedule the booking");
+    await changePaidByWallet(testInfo, "group size", async () => {
+      const next = await addPlayers(app, booking!, env.groupSizeUpdate);
+      await confirmChangeDetails(app, testInfo, "reschedule", next);
+      return next;
+    });
+    resized = true;
+  });
+
+  test(`TC135: extend the wallet booking -> ${env.extendBy} -> calendar`, async ({}, testInfo) => {
+    test.skip(!resized, "TC134 did not update the group size");
+    await changePaidByWallet(testInfo, "extend", async () => {
+      const popup = await openExtendPopup(app, booking!);
+      await app.guidedClick(popup.getByRole("button", { name: env.extendBy, exact: true }));
+      const next = await continueExtend(app, popup, booking!, extraSlots);
+      await confirmChangeDetails(app, testInfo, "extend", next);
+      return next;
+    });
+    extended = true;
+  });
+
+  test("TC136: cancel the wallet booking -> refund shown and applied -> the wallet's part is back in the wallet -> slots free", async ({}, testInfo) => {
+    test.skip(!extended, "TC135 did not extend the booking");
+    const wallet = await app.walletBalance();
+    const p = (await app.fetchBooking(booking!.bookingId))?.paymentBreakdown ?? {};
+    await cancelInUi(app, testInfo, booking!, { checkRefund: true });
+    suite.markCancelled();
+    const refunded = Number((await app.fetchBooking(booking!.bookingId))?.metadata?.refundAmount ?? 0);
+    // The fee is taken from the card first, then the wallet; what is left of the wallet's part comes back to it
+    const card = Number(p.cardAmount || 0);
+    const paidWallet = Number(p.walletAmount || 0);
+    const fee = round2(card + paidWallet - refunded);
+    const back = round2(paidWallet - Math.max(0, round2(fee - card)));
+    testInfo.annotations.push({ type: "wallet", description: `refund to the wallet: $${back.toFixed(2)} of $${paidWallet.toFixed(2)}` });
+    await expect
+      .poll(async () => round2(await app.walletBalance()), { message: `wallet balance = $${wallet.toFixed(2)} + $${back.toFixed(2)}`, timeout: 20_000 })
+      .toBe(round2(wallet + back));
+    await expectBookingGone(app, booking!);
   });
 });

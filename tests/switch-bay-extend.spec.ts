@@ -16,13 +16,14 @@ import {
 import { expect, test } from "./fixtures";
 
 /**
- * Extend to another bay, the last part of npm test. Both cases: only 30 min free after the booking (another booking
+ * Extend to another bay, the last card-paid part of npm test. Both cases: only 30 min free after the booking (another booking
  * starts then) -> Extend -> +30 min (the limit) -> a "book a new session" option -> pick a bay in the dropdown -> 1 hr
  * -> Continue -> Booking Details -> the new session on that bay is booked.
  *  TC100–102 "Switch bay, keep playing" (another bay of any kind)
  *  TC103–105 "Switch to Trackman" (the green promo; only offered when the booking is on an Impact Vision bay)
  * Kept in its own file because Playwright runs files in name order: "switch-…" sorts after booking-flow,
- * booking-reschedule and refund-cancel, so npm test runs it last. Also part of npm run test:extend.
+ * booking-reschedule and refund-cancel, so npm test runs it after those; the wallet, gift card and membership
+ * cases (x-, y-, z-…) follow. Also part of npm run test:extend.
  */
 
 const GAP = 2; // 30 min free after the first booking
@@ -45,7 +46,7 @@ async function bookWithBlockerAfter(
     app,
     testInfo,
     { reuseOpenPage: true, rescheduleRoom: false, alsoFree: slotsAfterRequested(GAP + HOUR) },
-    { excludeBayIds },
+    { excludeBayIds, cardOnly: true },
   );
   track(first);
   await app.viewMyBooking(first, { highlight: false });

@@ -690,6 +690,11 @@ export class BookingApp {
       }
       return;
     }
+    // A new booking (Booking Details): "Use Different Card" -> the test card is typed. Changes of a booking (Reschedule /
+    // Extend details) use the saved card: every typed card stays attached to the Stripe customer, and Stripe allows
+    // only so many per customer ("already has the maximum number of payment methods attached")
+    const newBooking = await modal.getByRole("heading", { name: "Booking Details" }).isVisible();
+    if (hasSaved && !newBooking) return;
     await this.enterCard(modal, env.stripe);
   }
 

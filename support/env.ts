@@ -62,6 +62,8 @@ export const env = {
   /** How long the journey test keeps the confirmation screen and the booked calendar on screen (ms). */
   showMs: Number(str("TEETIME_SHOW_MS", "3000")) || 0,
   emailArriveMs: Number(str("TEETIME_EMAIL_ARRIVE_MS", "1000")),
+  /** The same for a NEW booking's email, which takes longer to arrive. */
+  newBookingEmailArriveMs: Number(str("TEETIME_NEW_BOOKING_EMAIL_ARRIVE_MS", "8000")),
   /** Watching a headed run: pause on each modal so it can be read (booking-flow.spec.ts). 0 = no pauses. */
   readMs: Number(str("TEETIME_READ_MS", "1000")) || 0,
   /** Draw a visible mouse cursor (arrow + click pulse) in the test browser; Playwright's window shows none. */

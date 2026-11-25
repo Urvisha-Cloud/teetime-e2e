@@ -1,6 +1,6 @@
 import type { BookingApp, CreatedBooking } from "../support/booking-app";
 import { env } from "../support/env";
-import { addPlayers, bookFreeSlot, bookingSuite, bookSlot, cancelInUi, chooseNewTime, confirmChangeDetails, continueExtend, exerciseExtendControls, expectBookingGone, expectConfirmed, openExtendPopup, presetSlots, requireBookingCreation, selectRequestedSlot, startReschedule, rescheduleSlotsRange } from "./helper";
+import { addPlayers, bookFreeSlot, bookingSuite, bookSlot, cancelInUi, chooseNewTime, confirmChangeDetails, continueExtend, exerciseExtendControls, expectBookingGone, expectConfirmed, expectPaidByCard, openExtendPopup, presetSlots, requireBookingCreation, selectRequestedSlot, startReschedule, rescheduleSlotsRange } from "./helper";
 import { expect, test, testUser } from "./fixtures";
 import { slotRange } from "../support/time";
 
@@ -36,7 +36,7 @@ test.describe("Booking flow: login -> create -> reschedule -> group size -> exte
     requireBookingCreation();
     // First free time (today, else the next days); later steps need the same bay free for the reschedule time AND
     // the extension after it. A failed create is cleaned up and retried with another free slot.
-    booking = await bookFreeSlot(app, testInfo, { reuseOpenPage: true, alsoFree: rescheduleSlotsRange(extraSlots) });
+    booking = await bookFreeSlot(app, testInfo, { reuseOpenPage: true, alsoFree: rescheduleSlotsRange(extraSlots) }, { cardOnly: true });
     suite.track(booking);
     await expectConfirmed(app, booking);
     await app.viewMyBooking(booking);
@@ -71,6 +71,7 @@ test.describe("Booking flow: login -> create -> reschedule -> group size -> exte
     await confirmChangeDetails(app, testInfo, "extend", after);
     booking = after;
     extended = true;
+    await expectPaidByCard(app, testInfo, booking); // reschedule, group size and extend too: all by card
     await app.viewMyBooking(booking);
   });
 

@@ -38,6 +38,12 @@ export function bookingSuite(onApp: (app: BookingApp) => void, { watch = false, 
     app = new BookingApp(sharedContext.pages()[0] ?? (await sharedContext.newPage()));
     app.watch = watch;
     onApp(app);
+    // A test that stopped early (skipped, failed) can leave a modal open, which blocks the next group's clicks
+    const leftOpen = app.page.locator('[role="dialog"][data-state="open"], #teetime-gift-prompt, #teetime-wallet-prompt');
+    if ((await leftOpen.count()) > 0 && app.page.url().startsWith(env.baseURL)) {
+      await app.page.goto("/book-now");
+      await app.waitForBookingUi();
+    }
   });
 
   test.afterEach(async ({}, testInfo) => {
@@ -237,6 +243,98 @@ export function rescheduleSlotsRange(extraSlots = 0): RelativeSlots {
   return { from: bookingSlots(), to: bookingSlots() + rescheduleSlots() + extraSlots - 1 };
 }
 
+// ───────────────────────────── paying by card only ─────────────────────────────
+// The app applies wallet credit (and a member's credit, in the plan's credit hours) by itself; Booking Details has no
+// switch for either. So a booking is paid by card alone only with an empty wallet and outside credit hours. Cancelling
+// a wallet-paid booking puts the money back into the wallet: the next booking would use it again.
+
+/** How long the "empty the wallet" popup waits (ms). */
+const EMPTY_WALLET_PROMPT_MS = 10 * 60_000;
+
+/** For a member: the part of the day after the plan's credit hours (no member credit there). Not a member: {}. */
+export async function outsideCreditHours(app: BookingApp): Promise<{ dayWindow?: { from: number; to: number } }> {
+  const m = await app.membership();
+  if (m?.status !== "active") return {};
+  const ends: number[] = (m.plan?.creditWindows ?? []).map((w: any) => {
+    const [h, min] = String(w.endTime).split(":").map(Number);
+    return h * 60 + min;
+  });
+  return ends.length ? { dayWindow: { from: Math.max(...ends), to: 24 * 60 } } : {};
+}
+
+/**
+ * The wallet is empty, so the card pays. With credit in it a popup asks YOU to remove it in admin (Users -> the wallet
+ * icon -> "Remove Credits"); the test watches the balance and goes on by itself at $0. "Skip" (or no change within
+ * EMPTY_WALLET_PROMPT_MS, or a headless run) skips the test: it would be paid from the wallet.
+ */
+export async function ensureEmptyWallet(app: BookingApp, testInfo: TestInfo, payWith = "card") {
+  await app.openIfNeeded();
+  let balance = await app.walletBalance();
+  if (balance <= 0) return;
+  const email = testUser.email ?? env.testEmail;
+  const why = () =>
+    `The wallet of ${email} has $${balance.toFixed(2)}, which the app would use instead of the ${payWith}: in admin ` +
+    `(Users -> wallet icon -> Remove Credits) set it to $0.00, then run again`;
+  test.skip(testInfo.project.use.headless !== false, why());
+  testInfo.setTimeout(testInfo.timeout + EMPTY_WALLET_PROMPT_MS); // waiting for you does not count against the test
+  console.log(`[teetime-e2e] ${payWith}: the wallet has $${balance.toFixed(2)}; remove it in admin, the test goes on at $0`);
+  await app.page.evaluate(({ email, payWith }) => {
+    (window as any).__teetimeWalletSkip = false;
+    document.getElementById("teetime-wallet-prompt")?.remove();
+    const box = document.createElement("div");
+    box.id = "teetime-wallet-prompt";
+    box.style.cssText =
+      "position:fixed;inset:0;z-index:2147483646;display:flex;align-items:center;justify-content:center;background:rgba(15,23,42,.5);font-family:inherit";
+    box.innerHTML = `
+      <div role="dialog" aria-modal="true" style="background:#fff;color:#0f172a;border-radius:20px;padding:24px;width:min(440px,calc(100% - 32px));box-shadow:0 25px 50px -12px rgba(0,0,0,.25)">
+        <h2 style="margin:0 0 8px;font-size:20px;font-weight:700">Empty the wallet first</h2>
+        <p style="margin:0 0 16px;font-size:14px;line-height:1.5;color:#64748b">These cases pay with the <b data-pay></b>, but the app uses wallet credit first. In admin: Users → <b data-email></b> → wallet icon → Remove Credits. The test continues by itself at $0.00.</p>
+        <div style="border:1px solid #bbf7d0;background:#f0fdf4;border-radius:12px;padding:12px 16px;font-size:14px;color:#166534">Wallet balance<div data-balance style="font-size:26px;font-weight:700"></div></div>
+        <div style="display:flex;justify-content:flex-end;margin-top:20px"><button type="button" style="height:44px;padding:0 20px;border-radius:12px;border:1px solid #e2e8f0;background:#fff;font:inherit;font-weight:600;cursor:pointer">Skip</button></div>
+      </div>`;
+    box.querySelector("[data-email]")!.textContent = email;
+    box.querySelector("[data-pay]")!.textContent = payWith;
+    box.querySelector("button")!.addEventListener("click", () => ((window as any).__teetimeWalletSkip = true));
+    document.body.appendChild(box);
+  }, { email, payWith });
+  for (const end = Date.now() + EMPTY_WALLET_PROMPT_MS; balance > 0 && Date.now() < end; ) {
+    const skipped = await app.page.evaluate((text) => {
+      const shown = document.querySelector("#teetime-wallet-prompt [data-balance]");
+      if (shown) shown.textContent = text;
+      return !!(window as any).__teetimeWalletSkip;
+    }, `$${balance.toFixed(2)}`);
+    if (skipped) break;
+    await app.page.waitForTimeout(1500);
+    balance = await app.walletBalance();
+  }
+  await app.page.evaluate(() => document.getElementById("teetime-wallet-prompt")?.remove());
+  test.skip(balance > 0, why());
+  testInfo.annotations.push({ type: "wallet", description: `emptied in admin: the ${payWith} pays` });
+  await app.open(); // the app forgets the balance it had read
+}
+
+/** The saved booking is paid by card alone: nothing from the wallet, gift cards or member credit. */
+export async function expectPaidByCard(app: BookingApp, testInfo: TestInfo, b: CreatedBooking) {
+  const p = (await app.fetchBooking(b.bookingId))?.paymentBreakdown ?? {};
+  testInfo.annotations.push({ type: "paymentBreakdown", description: JSON.stringify(p).slice(0, 300) });
+  const gifts = (p.giftCards ?? []).reduce((sum: number, g: any) => sum + Number(g.amount || 0), 0);
+  expect(Number(p.walletAmount || 0), "card only: nothing from the wallet").toBe(0);
+  expect(gifts, "card only: nothing from a gift card").toBe(0);
+  expect(Number(p.membershipCreditAmount || 0), "card only: no member credit").toBe(0);
+  expect(Number(p.cardAmount || 0), "card only: the card paid").toBeGreaterThan(0);
+}
+
+/** What Booking Details charges before the wallet and the gift card (group size 1): session price − member credit − member discount. */
+export function dueBeforeWallet(modalText: string): number {
+  const amount = (re: RegExp) => Number((modalText.match(re)?.[1] ?? "0").replace(/,/g, ""));
+  const price =
+    amount(/Session price after discounts\s*\$(\d+(?:,\d{3})*\.\d{2})/) || amount(/Session price\s*\$(\d+(?:,\d{3})*\.\d{2})/);
+  if (!price) throw new Error(`No session price in Booking Details: ${modalText.slice(0, 300)}`);
+  const credit = amount(/Membership credit\s*[–-]\s*\$(\d+(?:,\d{3})*\.\d{2})/);
+  const discount = amount(/Member discount(?:\s*\(\d+% off\))?\s*[–-]\s*\$(\d+(?:,\d{3})*\.\d{2})/);
+  return round2(price - credit - discount);
+}
+
 // ───────────────────────────── create ─────────────────────────────
 
 /**
@@ -287,18 +385,39 @@ export async function bookFreeSlot(
     groupSize = 1,
     attempts = 3,
     excludeBayIds = [],
-  }: { groupSize?: number; attempts?: number; /** never book these bays (e.g. all but Impact Vision) */ excludeBayIds?: string[] } = {},
+    cardOnly = false,
+  }: {
+    groupSize?: number;
+    attempts?: number;
+    /** never book these bays (e.g. all but Impact Vision) */
+    excludeBayIds?: string[];
+    /** The card pays all of it: empty wallet (a popup asks to empty it), outside member credit hours, checked afterwards. */
+    cardOnly?: boolean;
+  } = {},
 ): Promise<CreatedBooking> {
+  if (cardOnly) {
+    await ensureEmptyWallet(app, testInfo);
+    options = { ...options, ...(await outsideCreditHours(app)) };
+  }
   let lastError: unknown;
+  let booked: CreatedBooking | undefined;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     // Retries reload the page, so the calendar shows the latest availability
     const sel = await selectRequestedSlot(app, testInfo, excludeBayIds, attempt === 1 ? options : { ...options, reuseOpenPage: false });
     const before = new Set(await app.myActiveBookingIds());
     try {
-      return await bookSlot(app, testInfo, sel, { groupSize });
+      booked = await bookSlot(app, testInfo, sel, { groupSize });
+      break;
     } catch (e) {
       if (testInfo.expectedStatus === "skipped") throw e; // a deliberate skip (e.g. no way to pay), not a failed slot
       lastError = e;
+      // Another slot cannot help: the test user's Stripe customer takes no more cards
+      if (/maximum number of payment methods/i.test(e instanceof Error ? e.message : String(e))) {
+        throw new Error(
+          `The card was refused, not the slot: the Stripe customer of ${testUser.email ?? env.testEmail} already has the maximum number of ` +
+            "cards. Remove old cards from that customer in the Stripe TEST dashboard, or rename .auth/e2e-user.json so the next run signs up a new test user.",
+        );
+      }
       const reason = (e instanceof Error ? e.message : String(e)).split("\n")[0].slice(0, 160);
       // Only bookings that appeared during this attempt (the test user's own) are cancelled
       const created = (await app.myActiveBookingIds().catch(() => [] as string[])).filter((id) => !before.has(id));
@@ -310,6 +429,10 @@ export async function bookFreeSlot(
       console.log(`[teetime-e2e] ${msg}${attempt < attempts ? "; trying another free slot" : ""}`);
       testInfo.annotations.push({ type: "retry", description: msg });
     }
+  }
+  if (booked) {
+    if (cardOnly) await expectPaidByCard(app, testInfo, booked); // a wrong payment is a failure, not a reason to retry
+    return booked;
   }
   throw new Error(`No booking could be created after ${attempts} attempts. Last error: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
 }
@@ -380,25 +503,38 @@ export const GIFT_CODE_KEY_DELAY_MS = 150;
  * refuses the code (e.g. "Gift code balance exhausted") -> the test is skipped with that reason, before anything is
  * confirmed.
  */
-export async function applyGiftCode(app: BookingApp, testInfo: TestInfo, modal: Locator, code: string) {
+export async function applyGiftCode(
+  app: BookingApp,
+  testInfo: TestInfo,
+  modal: Locator,
+  code: string,
+  /** A refused code: "skip" the test, or "continue" without the gift card (the card pays). */
+  { onRefused = "skip" }: { onRefused?: "skip" | "continue" } = {},
+) {
   const before = await app.amountToPay(modal);
   if (before <= 0) return { before, after: before };
-  await app.guidedClick(modal.getByText(/Have a gift card\?/), { read: app.readMs });
   const field = modal.getByPlaceholder(/gift|code/i).or(modal.getByRole("textbox", { name: /gift|code/i })).first();
+  // Already open after a refused code (a second click would close it again)
+  if (!(await field.isVisible())) await app.guidedClick(modal.getByText(/Have a gift card\?/), { read: app.readMs });
   await expect(field, "gift card code field").toBeVisible();
   // Typed key by key (visible while watching), not pasted in at once
   await app.guidedClick(field);
   await field.clear();
   await field.pressSequentially(code, { delay: GIFT_CODE_KEY_DELAY_MS });
+  // Applied: "You pay" goes down — or the app says why the code cannot be used (Apply clears an earlier message)
+  const refused = modal.getByText(/balance exhausted|invalid|expired|not found|no balance|already used/i).first();
   await app.guidedClick(modal.getByRole("button", { name: /^(Apply|Redeem|Use)/i }).first(), { read: app.readMs });
 
-  // Applied: "You pay" goes down — or the app says why the code cannot be used
-  const refused = modal.getByText(/balance exhausted|invalid|expired|not found|no balance|already used/i).first();
   let applied = false;
   for (const end = Date.now() + 15_000; Date.now() < end && !applied; ) {
     if (await refused.isVisible().catch(() => false)) {
       const why = (await refused.innerText()).trim();
       testInfo.annotations.push({ type: "gift-card", description: `${code}: ${why}` });
+      if (onRefused === "continue") {
+        console.log(`[teetime-e2e] gift card: ${code}: ${why}; the card pays instead`);
+        await field.clear();
+        return { before, after: before };
+      }
       test.skip(true, `The gift card code ${code} cannot be used ("${why}"): enter another code in the popup, or set a new TEETIME_GIFT_CARD_CODE in .env`);
     }
     applied = (await app.amountToPay(modal)) < before;
@@ -607,7 +743,7 @@ export async function confirmChangeDetails(
     await app.verifyGroupSize(details, b.groupSize);
   }
   // The gift card pays (part of) the difference first, when one is given and something is due
-  const gift = giftCode ? await applyGiftCode(app, testInfo, details, giftCode) : null;
+  const gift = giftCode ? await applyGiftCode(app, testInfo, details, giftCode, { onRefused: "continue" }) : null;
   if (gift) testInfo.annotations.push({ type: "gift-card", description: `${title}: $${gift.before.toFixed(2)} -> $${gift.after.toFixed(2)} after the gift card` });
   await app.scrollThrough(details); // slowly down through the price breakdown to the waiver
   // The saved card ("Use Different Card") is shown even when nothing is due (e.g. "Previously paid" covers the
@@ -920,6 +1056,18 @@ export function extendEndLabel(base: CreatedBooking, slots: number): string {
   return `${weekday} ${time}`;
 }
 
+/** The extra time the popup opens with: 30 min, or 15 min when only that is free (ExtendBookingModal defaultExtendSlots). */
+export const defaultExtendSlots = (max: number) => Math.max(1, Math.min(2, max));
+
+/** From the time the popup opens with to `slots`, with the + / − buttons. */
+export async function stepExtendTo(app: BookingApp, popup: Locator, base: CreatedBooking, slots: number) {
+  const start = defaultExtendSlots(Number(await slider(popup).getAttribute("max")));
+  await expectExtendSelection(popup, base, start);
+  const button = popup.getByRole("button", { name: slots > start ? "Add 15 minutes" : "Remove 15 minutes" });
+  for (let i = 0; i < Math.abs(slots - start); i++) await app.guidedClick(button);
+  await expectExtendSelection(popup, base, slots);
+}
+
 const slider = (popup: Locator) => popup.getByRole("slider", { name: "Additional time" });
 
 /** The label, the slider position and "Ends …" all show `slots`; the original end time is still shown. */
@@ -952,7 +1100,7 @@ async function dragExtendSlider(app: BookingApp, popup: Locator, slots: number, 
 /**
  * Uses every way to pick the extra time and checks they always agree, then leaves `finalSlots` selected by
  * dragging the slider. Adapts to the maximum the popup offers (free time after the booking, up to 3 hr).
- *  start at +15 min ("−" disabled) · "+" up to +1 hr · "−" one step · every preset that fits · "+" to the maximum
+ *  start at the default +30 min (+15 min, "−" disabled, when only that is free) · "+" up to +1 hr · "−" one step · every preset that fits · "+" to the maximum
  *  ("+" disabled; past midnight the end shows the weekday) · back to the minimum · slider drag to `finalSlots`
  * Returns the maximum in slots.
  */
@@ -963,14 +1111,16 @@ export async function exerciseExtendControls(app: BookingApp, popup: Locator, ba
   expect(max, `the popup must offer at least ${formatMinutes(finalSlots * 15)}`).toBeGreaterThanOrEqual(finalSlots);
   await expect(popup, "slider's right end shows the maximum").toContainText(formatMinutes(max * 15));
 
-  // Starts at the minimum
-  await expectExtendSelection(popup, base, 1);
-  await expect(minus, "− disabled at the minimum").toBeDisabled();
+  // Starts at the default
+  const start = defaultExtendSlots(max);
+  await expectExtendSelection(popup, base, start);
+  if (start > 1) await expect(minus, "− enabled at the default").toBeEnabled();
+  else await expect(minus, "− disabled at the minimum").toBeDisabled();
   await app.readPause();
 
   // "+" up to +1 hr (or the maximum), then "−" one step
   const up = Math.min(4, max);
-  for (let i = 1; i < up; i++) await app.guidedClick(plus);
+  for (let i = start; i < up; i++) await app.guidedClick(plus);
   await expectExtendSelection(popup, base, up);
   await app.readPause();
   if (up > 1) {
@@ -1019,11 +1169,11 @@ export async function exerciseExtendControls(app: BookingApp, popup: Locator, ba
 
 /**
  * Timing of each email step, in order before the next step: the checkout screen -> TEETIME_EMAIL_ARRIVE_MS (default
- * 1 s) -> the inbox opens ONCE (one new tab), the window on top — YopMail opens the NEWEST email by itself — it loads
+ * 1 s; a new booking's email takes longer: TEETIME_NEW_BOOKING_EMAIL_ARRIVE_MS, 8 s) -> the inbox opens ONCE (one new tab), the window on top — YopMail opens the NEWEST email by itself — it loads
  * (YOPMAIL_LOAD_MS) and stays visible YOPMAIL_SHOW_MS (1 s) -> the window moves behind the test browser -> next step.
  * If the new email has not arrived by then, the newest one is still the PREVIOUS email (after create the last cancel
  * email or the login code, after a reschedule the create email, after a cancel the reschedule email) and the test
- * cannot click another email in that window: then raise TEETIME_EMAIL_ARRIVE_MS in .env (e.g. 10000).
+ * cannot click another email in that window: then raise these two in .env.
  */
 const YOPMAIL_LOAD_MS = 4_000;
 const YOPMAIL_SHOW_MS = 1_000;
@@ -1102,7 +1252,8 @@ export async function showBookingEmail(app: BookingApp, testInfo: TestInfo, b: C
   // In order, before the next step: checkout screen -> TEETIME_EMAIL_ARRIVE_MS (1 s) -> YopMail on top with this
   // step's email -> loaded + 1 s visible -> behind -> the test browser in front again -> the next step
   testInfo.annotations.push({ type: "booking-email", description: `${EMAIL_SUBJECT[kind]}: shown in YopMail (${inbox}; ${look})` });
-  if (env.emailArriveMs > 0) await app.page.waitForTimeout(env.emailArriveMs);
+  const arriveMs = kind === "confirmed" ? Math.max(env.emailArriveMs, env.newBookingEmailArriveMs) : env.emailArriveMs;
+  if (arriveMs > 0) await app.page.waitForTimeout(arriveMs);
   console.log(`[teetime-e2e] YopMail window on top: "${EMAIL_SUBJECT[kind]}" (${look})`);
   await moveWindow(openInbox().pid, "top");
   await app.page.waitForTimeout(YOPMAIL_LOAD_MS + YOPMAIL_SHOW_MS);

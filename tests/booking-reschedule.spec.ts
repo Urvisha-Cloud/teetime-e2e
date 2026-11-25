@@ -109,7 +109,7 @@ for (const { minutes, label, first } of [
     test(`TC${first}: book the slot to move ${label}`, async ({}, testInfo) => {
       requireBookingCreation();
       // The 15 minutes the booking moves into must be free in the same bay too
-      original = await bookFreeSlot(app, testInfo, { reuseOpenPage: true, alsoFree: shiftRoom });
+      original = await bookFreeSlot(app, testInfo, { reuseOpenPage: true, alsoFree: shiftRoom }, { cardOnly: true });
       suite.track(original);
       await app.viewMyBooking(original, { highlight: false });
     });
@@ -126,7 +126,7 @@ for (const { minutes, label, first } of [
         console.log(`[teetime-e2e] the 15 min ${label} is no longer free for ${original!.startTime}–${original!.endTime}; booking another slot`);
         const res = await app.cancelBooking(original!.bookingId);
         console.log(`[teetime-e2e] cleanup: cancel ${original!.bookingId}: HTTP ${res.status}`);
-        original = await bookFreeSlot(app, testInfo, { alsoFree: shiftRoom });
+        original = await bookFreeSlot(app, testInfo, { alsoFree: shiftRoom }, { cardOnly: true });
         suite.track(original);
         await app.viewMyBooking(original, { highlight: false });
       }

@@ -136,7 +136,7 @@ async function toMembership(app: BookingApp) {
   await expect(app.page.getByText("Monthly credit, member discount and more")).toBeVisible();
 }
 
-test.describe("Core membership: credit booking and discount booking @creates-booking", () => {
+test.describe("Core membership: credit booking and discount booking @main @creates-booking", () => {
   let app: BookingApp;
   const suite = bookingSuite((a) => (app = a), { watch: true });
   let member: any = null; // GET /membership/me once active (TC116)
@@ -161,6 +161,10 @@ test.describe("Core membership: credit booking and discount booking @creates-boo
     await toMembership(app);
 
     member = await app.membership();
+    if (isElite(member)) {
+      member = null; // TC117–121 are skipped too: they check a Core member
+      test.skip(true, "Already an Elite member (an earlier run upgraded it): the Core cases need an account without membership, or on Core");
+    }
     if (member?.status === "active") {
       const note = `${testUser.email ?? "the test user"} is already an active ${member.plan?.name} member (credit $${Number(member.creditBalance).toFixed(2)}): nothing to buy`;
       testInfo.annotations.push({ type: "membership", description: note });
@@ -432,7 +436,7 @@ const clock = (hhmm: string) => Number(hhmm.split(":")[0]) * 60 + Number(hhmm.sp
 const creditHours = (plan: any) => ({ from: clock(plan.creditWindows[0].startTime), to: clock(plan.creditWindows[0].endTime) });
 const creditBalance = async (app: BookingApp) => round2(Number((await app.membership())?.creditBalance ?? NaN));
 
-test.describe("Elite membership: upgrade, credit booking and discount booking @creates-booking", () => {
+test.describe("Elite membership: upgrade, credit booking and discount booking @main @creates-booking", () => {
   let app: BookingApp;
   const suite = bookingSuite((a) => (app = a), { watch: true });
   let elite: any = null; // GET /membership/me once Elite (TC123)
@@ -710,7 +714,7 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @c
 const CANCEL_REASONS = ["Too expensive", "Not using it enough", "Moving away", "Switching to another place", "Just taking a break", "Other"];
 const CANCEL_REASON = "Just taking a break";
 
-test.describe("Cancel and keep membership @creates-booking", () => {
+test.describe("Cancel and keep membership @main @creates-booking", () => {
   let app: BookingApp;
   const suite = bookingSuite((a) => (app = a), { watch: true });
   let start: any = null; // GET /membership/me before cancelling

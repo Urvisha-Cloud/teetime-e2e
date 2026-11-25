@@ -37,7 +37,7 @@ REFUND_CASES.forEach((c, i) => {
 
     test(`TC${first}: book a slot (${c.name})`, async ({}, testInfo) => {
       requireBookingCreation();
-      booking = await bookFreeSlot(app, testInfo, { reuseOpenPage: true, ...c.slot }); // skipped if no such time is free
+      booking = await bookFreeSlot(app, testInfo, { reuseOpenPage: true, ...c.slot }, { cardOnly: true }); // skipped if no such time is free
       suite.track(booking);
       await app.viewMyBooking(booking, { highlight: false });
     });

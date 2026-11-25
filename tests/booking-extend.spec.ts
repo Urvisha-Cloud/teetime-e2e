@@ -19,6 +19,7 @@ import {
   requireBookingCreation,
   selectRequestedSlot,
   slotsAfterRequested,
+  stepExtendTo,
 } from "./helper";
 import { expect, test } from "./fixtures";
 
@@ -369,8 +370,7 @@ test.describe("Extend booking: past midnight @creates-booking", () => {
       await app.page.keyboard.press("Escape");
       test.skip(true, `Only ${formatMinutes(max * 15)} free after ${b.endTime}, not enough to pass midnight`);
     }
-    const plus = popup.getByRole("button", { name: "Add 15 minutes" });
-    for (let i = 1; i < need; i++) await app.guidedClick(plus);
+    await stepExtendTo(app, popup, b, need); // from the default (+30 min)
     extended = await continueExtend(app, popup, b, need); // checks "Ends <next day> 12:15 AM" style label
     await confirmChangeDetails(app, testInfo, "extend", extended);
     suite.track(extended);
@@ -423,6 +423,7 @@ test.describe("Extend booking: session in progress -> 'Extend session' button @c
       await app.guidedClick(app.page.getByRole("dialog").getByRole("button").filter({ hasText: b.startTime }).first());
     }
     await expect(popup).toBeVisible();
+    await stepExtendTo(app, popup, b, 1); // the popup starts at +30 min when that is free
     const next = await continueExtend(app, popup, b, 1);
     await confirmChangeDetails(app, testInfo, "extend", next);
     suite.track(next);
