@@ -2,8 +2,7 @@ import type { BookingApp, CreatedBooking } from "../support/booking-app";
 import { env } from "../support/env";
 import { fromMinutes } from "../support/time";
 import {
-  applyGiftCode,
-  askGiftCode,
+  askAndApplyGiftCode,
   bookingSuite,
   cancelInUi,
   chooseNewTime,
@@ -11,7 +10,6 @@ import {
   continueExtend,
   dueBeforeWallet,
   ensureEmptyWallet,
-  endTimeOption,
   expectBookingGone,
   expectConfirmed,
   openExtendPopup,
@@ -20,6 +18,7 @@ import {
   presetSlots,
   requireBookingCreation,
   selectRequestedSlot,
+  setBookingHours,
   showBookingEmail,
   slotsAfterRequested,
   startReschedule,
@@ -110,15 +109,10 @@ test.describe("Gift card at checkout @main @creates-booking", () => {
         `The wallet credit ($${walletBefore.toFixed(2)}) covers even a ${MAX_BOOKING_HOURS}-hr booking ` +
           `($${perHour.toFixed(2)}/hr), so Booking Details never shows "Have a gift card?"`,
       );
-      const endIdx = sel.startIdx + hours * 4 - 1;
-      const endTime = fromMinutes((endIdx + 1) * 15);
-      const why = `the wallet's $${walletBefore.toFixed(2)} covers ${hoursNow} hr ($${perHour.toFixed(2)}/hr): End Time ${endTime} (${hours} hr)`;
+      const why = `the wallet's $${walletBefore.toFixed(2)} covers ${hoursNow} hr ($${perHour.toFixed(2)}/hr): booked for ${hours} hr`;
       console.log(`[teetime-e2e] gift card: ${why}`);
       testInfo.annotations.push({ type: "booking-length", description: why });
-      await app.guidedClick(modal.getByRole("combobox").nth(2)); // End Time
-      await app.guidedClick(endTimeOption(app, endTime), { read: app.readMs });
-      await expect(modal, "Booking Details shows the longer time").toContainText(`${sel.startTime} - ${endTime}`);
-      sel = { ...sel, endIdx, endTime };
+      sel = await setBookingHours(app, modal, sel, hours); // End Time
       await expect.poll(() => app.amountToPay(modal), { message: `"You pay" above $0 for ${hours} hr`, timeout: 10_000 }).toBeGreaterThan(0);
       before = await app.amountToPay(modal);
     }
@@ -130,18 +124,10 @@ test.describe("Gift card at checkout @main @creates-booking", () => {
 
     // The code to use: a popup in Booking Details asks you for it (the field starts empty: you type the code);
     // headless, nobody can answer, so TEETIME_GIFT_CARD_CODE is used as it is
-    giftCode = headless ? env.giftCardCode : await askGiftCode(app, testInfo, modal);
-    test.skip(!giftCode, "No gift card code entered in the popup");
-
-    // "Have a gift card?" -> the code -> Apply ("You pay" goes down). A refused code (used up, already redeemed, …): the
-    // popup asks for another one; the 3rd refused code (headless: the 1st) skips with the app's reason
-    const tries = headless ? 1 : 3;
-    let { after } = await applyGiftCode(app, testInfo, modal, giftCode, { onRefused: tries > 1 ? "continue" : "skip" });
-    for (let attempt = 2; after >= before && attempt <= tries; attempt++) {
-      giftCode = await askGiftCode(app, testInfo, modal);
-      test.skip(!giftCode, "The gift card code was refused and no other code was entered in the popup");
-      ({ after } = await applyGiftCode(app, testInfo, modal, giftCode, { onRefused: attempt < tries ? "continue" : "skip" }));
-    }
+    // -> "Have a gift card?" -> the code -> Apply ("You pay" goes down); a refused code is asked again
+    const gift = await askAndApplyGiftCode(app, testInfo, modal, headless);
+    giftCode = gift.code;
+    const after = gift.after;
     // The booking time stays as selected (no End Time change): straight on to the waiver and Confirm
     const price = dueBeforeWallet(await modal.innerText());
     // The wallet's credit is applied first, then the gift card, then the card pays what is left

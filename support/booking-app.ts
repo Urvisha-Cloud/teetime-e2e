@@ -839,6 +839,21 @@ export class BookingApp {
     return data && typeof data === "object" && data.status ? data : null;
   }
 
+  /** A gift card as the app checks it (GET /giftCode/validate/:code): what is left on it, or why it cannot be used. */
+  async giftCard(code: string): Promise<{ valid: boolean; balance: number; message: string }> {
+    const { status, body } = await this.authedFetch(`${env.apiURL}/giftCode/validate/${encodeURIComponent(code)}`);
+    expect(status, "GET /giftCode/validate").toBe(200);
+    const balance = body?.isValid ? Math.round((Number(body.data.amount) - Number(body.data.usedAmount)) * 100) / 100 : 0;
+    return { valid: body?.isValid === true, balance, message: String(body?.message ?? "") };
+  }
+
+  /** What is left on a gift card that was already used in this run; 0 when it is used up. */
+  async giftCardBalance(code: string): Promise<number> {
+    const { valid, balance, message } = await this.giftCard(code);
+    if (!valid) expect(message, "a gift card without a balance is used up").toMatch(/exhausted/i);
+    return balance;
+  }
+
   /** The wallet's transaction history, newest first (GET /wallet/transactions). */
   async walletTransactions(): Promise<any[]> {
     const { status, body } = await this.authedFetch(`${env.apiURL}/wallet/transactions`);

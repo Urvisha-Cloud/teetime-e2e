@@ -21,6 +21,7 @@
     "test:cancel": "playwright test tests/booking-cancel.spec.ts tests/refund-cancel.spec.ts --headed",
     "test:extend": "playwright test tests/booking-extend.spec.ts tests/switch-bay-extend.spec.ts --headed",
     "test:wallet": "playwright test tests/x-wallet.spec.ts --headed",
+    "test:wallet-gift-card": "playwright test tests/xy-wallet-gift-card.spec.ts --headed",
     "test:gift-card": "playwright test tests/y-gift-card.spec.ts --headed",
     "test:membership": "playwright test tests/z-membership.spec.ts --headed",
     "test:negative": "playwright test tests/booking-negative.spec.ts tests/payment-negative.spec.ts --headed",

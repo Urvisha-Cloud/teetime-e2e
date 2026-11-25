@@ -268,17 +268,46 @@ export async function outsideCreditHours(app: BookingApp): Promise<{ dayWindow?:
  * EMPTY_WALLET_PROMPT_MS, or a headless run) skips the test: it would be paid from the wallet.
  */
 export async function ensureEmptyWallet(app: BookingApp, testInfo: TestInfo, payWith = "card") {
+  await waitForWallet(app, testInfo, {
+    ok: (balance) => balance <= 0,
+    title: "Empty the wallet first",
+    intro: `These cases pay with the ${payWith}, but the app uses wallet credit first.`,
+    todo: "Remove Credits. The test continues by itself at $0.00.",
+    why: `the app would use it instead of the ${payWith}: set it to $0.00 in admin (Users -> wallet icon -> Remove Credits), then run again`,
+    done: `emptied in admin: the ${payWith} pays`,
+  });
+}
+
+/**
+ * The wallet has some credit, but less than a booking costs ($min–$max), so the wallet AND a gift card can pay for the
+ * same booking. Otherwise the same popup as ensureEmptyWallet asks YOU to set it in admin. Returns the balance.
+ */
+export async function ensureSmallWallet(app: BookingApp, testInfo: TestInfo, { min, max, suggest }: { min: number; max: number; suggest: number }) {
+  return waitForWallet(app, testInfo, {
+    ok: (balance) => balance >= min && balance <= max,
+    title: `Set the wallet to $${suggest.toFixed(2)}`,
+    intro: "This case pays one booking with the wallet and a gift card, so the wallet must cover only a part of it.",
+    todo: `Add Credits or Remove Credits. The test continues by itself between $${min.toFixed(2)} and $${max.toFixed(2)}.`,
+    why: `a booking paid by wallet + gift card needs $${min.toFixed(2)}–$${max.toFixed(2)} in it: set it to $${suggest.toFixed(2)} in admin (Users -> wallet icon), then run again`,
+    done: "set in admin: the wallet pays a part, the gift card the rest",
+  });
+}
+
+/** Waits until the wallet balance is `ok`: a popup asks YOU to change it in admin (see ensureEmptyWallet). Returns it. */
+async function waitForWallet(
+  app: BookingApp,
+  testInfo: TestInfo,
+  { ok, title, intro, todo, why, done }: { ok: (balance: number) => boolean; title: string; intro: string; todo: string; why: string; done: string },
+): Promise<number> {
   await app.openIfNeeded();
   let balance = await app.walletBalance();
-  if (balance <= 0) return;
+  if (ok(balance)) return balance;
   const email = testUser.email ?? env.testEmail;
-  const why = () =>
-    `The wallet of ${email} has $${balance.toFixed(2)}, which the app would use instead of the ${payWith}: in admin ` +
-    `(Users -> wallet icon -> Remove Credits) set it to $0.00, then run again`;
-  test.skip(testInfo.project.use.headless !== false, why());
+  const reason = () => `The wallet of ${email} has $${balance.toFixed(2)}; ${why}`;
+  test.skip(testInfo.project.use.headless !== false, reason());
   testInfo.setTimeout(testInfo.timeout + EMPTY_WALLET_PROMPT_MS); // waiting for you does not count against the test
-  console.log(`[teetime-e2e] ${payWith}: the wallet has $${balance.toFixed(2)}; remove it in admin, the test goes on at $0`);
-  await app.page.evaluate(({ email, payWith }) => {
+  console.log(`[teetime-e2e] wallet: $${balance.toFixed(2)}. ${title}: in admin, the test then goes on by itself`);
+  await app.page.evaluate(({ email, title, intro, todo }) => {
     (window as any).__teetimeWalletSkip = false;
     document.getElementById("teetime-wallet-prompt")?.remove();
     const box = document.createElement("div");
@@ -287,17 +316,16 @@ export async function ensureEmptyWallet(app: BookingApp, testInfo: TestInfo, pay
       "position:fixed;inset:0;z-index:2147483646;display:flex;align-items:center;justify-content:center;background:rgba(15,23,42,.5);font-family:inherit";
     box.innerHTML = `
       <div role="dialog" aria-modal="true" style="background:#fff;color:#0f172a;border-radius:20px;padding:24px;width:min(440px,calc(100% - 32px));box-shadow:0 25px 50px -12px rgba(0,0,0,.25)">
-        <h2 style="margin:0 0 8px;font-size:20px;font-weight:700">Empty the wallet first</h2>
-        <p style="margin:0 0 16px;font-size:14px;line-height:1.5;color:#64748b">These cases pay with the <b data-pay></b>, but the app uses wallet credit first. In admin: Users → <b data-email></b> → wallet icon → Remove Credits. The test continues by itself at $0.00.</p>
+        <h2 data-title style="margin:0 0 8px;font-size:20px;font-weight:700"></h2>
+        <p style="margin:0 0 16px;font-size:14px;line-height:1.5;color:#64748b"><span data-intro></span> In admin: Users → <b data-email></b> → wallet icon → <span data-todo></span></p>
         <div style="border:1px solid #bbf7d0;background:#f0fdf4;border-radius:12px;padding:12px 16px;font-size:14px;color:#166534">Wallet balance<div data-balance style="font-size:26px;font-weight:700"></div></div>
         <div style="display:flex;justify-content:flex-end;margin-top:20px"><button type="button" style="height:44px;padding:0 20px;border-radius:12px;border:1px solid #e2e8f0;background:#fff;font:inherit;font-weight:600;cursor:pointer">Skip</button></div>
       </div>`;
-    box.querySelector("[data-email]")!.textContent = email;
-    box.querySelector("[data-pay]")!.textContent = payWith;
+    for (const [key, text] of Object.entries({ email, title, intro, todo })) box.querySelector(`[data-${key}]`)!.textContent = text;
     box.querySelector("button")!.addEventListener("click", () => ((window as any).__teetimeWalletSkip = true));
     document.body.appendChild(box);
-  }, { email, payWith });
-  for (const end = Date.now() + EMPTY_WALLET_PROMPT_MS; balance > 0 && Date.now() < end; ) {
+  }, { email: email ?? "", title, intro, todo });
+  for (const end = Date.now() + EMPTY_WALLET_PROMPT_MS; !ok(balance) && Date.now() < end; ) {
     const skipped = await app.page.evaluate((text) => {
       const shown = document.querySelector("#teetime-wallet-prompt [data-balance]");
       if (shown) shown.textContent = text;
@@ -308,9 +336,10 @@ export async function ensureEmptyWallet(app: BookingApp, testInfo: TestInfo, pay
     balance = await app.walletBalance();
   }
   await app.page.evaluate(() => document.getElementById("teetime-wallet-prompt")?.remove());
-  test.skip(balance > 0, why());
-  testInfo.annotations.push({ type: "wallet", description: `emptied in admin: the ${payWith} pays` });
+  test.skip(!ok(balance), reason());
+  testInfo.annotations.push({ type: "wallet", description: `$${balance.toFixed(2)}, ${done}` });
   await app.open(); // the app forgets the balance it had read
+  return balance;
 }
 
 /** The saved booking is paid by card alone: nothing from the wallet, gift cards or member credit. */
@@ -580,12 +609,15 @@ export async function askGiftCode(
     suggested = "",
     primaryButton,
     target = '"Have a gift card?"',
+    hint = "",
   }: {
     suggested?: string;
     /** The modal's main button, whose look "Apply this code" copies (default: Booking Details' Confirm). */
     primaryButton?: Locator;
     /** Where the test types the code, named in the popup's text. */
     target?: string;
+    /** An extra line in the popup (e.g. which code the test needs). */
+    hint?: string;
   } = {},
 ): Promise<string> {
   testInfo.setTimeout(testInfo.timeout + GIFT_CODE_PROMPT_MS); // waiting for you does not count against the test
@@ -597,7 +629,7 @@ export async function askGiftCode(
     primary: await styleOf(primaryButton ?? app.confirmButton(modal), ["background-color", "background-image", "color", "border-radius", "font-weight", "box-shadow"]),
   };
   await modal.evaluate(
-    (_modalEl, { suggested, theme, target }) => {
+    (_modalEl, { suggested, theme, target, hint }) => {
       (window as any).__teetimeGiftCode = undefined;
       document.getElementById("teetime-gift-prompt")?.remove();
       // A copied value, unless it is missing or see-through; then the app's theme variable (shadcn: --primary …)
@@ -671,7 +703,7 @@ export async function askGiftCode(
             </span>
             <h2 class="tg-title" id="teetime-gift-title">Gift card code</h2>
           </div>
-          <p class="tg-text">Enter the gift card code to apply. The test types it into ${target} and continues.</p>
+          <p class="tg-text">Enter the gift card code to apply. The test types it into ${target} and continues. <b data-hint></b></p>
           <label for="teetime-gift-input">Code</label>
           <input id="teetime-gift-input" autocomplete="off" spellcheck="false" placeholder="e.g. GOLFXXXXXXXX" />
           <div class="tg-actions">
@@ -680,6 +712,7 @@ export async function askGiftCode(
           </div>
         </div>`;
       // On the page itself (not inside the modal), so the overlay covers the whole window
+      box.querySelector("[data-hint]")!.textContent = hint;
       document.body.appendChild(box);
       const input = box.querySelector<HTMLInputElement>("#teetime-gift-input")!;
       const ok = box.querySelector<HTMLButtonElement>("#teetime-gift-ok")!;
@@ -709,7 +742,7 @@ export async function askGiftCode(
       box.querySelector("#teetime-gift-skip")!.addEventListener("click", () => done(""));
       setTimeout(() => input.focus(), 50);
     },
-    { suggested, theme, target },
+    { suggested, theme, target, hint },
   );
   const answered = await app.page
     .waitForFunction(() => (window as any).__teetimeGiftCode !== undefined, null, { timeout: GIFT_CODE_PROMPT_MS, polling: 300 })
@@ -718,6 +751,24 @@ export async function askGiftCode(
   if (!answered) await app.page.evaluate(() => document.getElementById("teetime-gift-prompt")?.remove()).catch(() => {});
   testInfo.annotations.push({ type: "gift-card", description: code ? `${code} (entered in the popup)` : answered ? "skipped in the popup" : "no code entered in time" });
   return code;
+}
+
+/**
+ * Booking Details: a popup asks YOU for the gift card code (headless: TEETIME_GIFT_CARD_CODE) -> applyGiftCode. A refused
+ * code (used up, already redeemed, …): the popup asks for another one; the 3rd refused code (headless: the 1st) skips
+ * the test with the app's reason. Returns the code and "You pay" before and after it.
+ */
+export async function askAndApplyGiftCode(app: BookingApp, testInfo: TestInfo, modal: Locator, headless: boolean) {
+  const tries = headless ? 1 : 3;
+  let code = headless ? env.giftCardCode : await askGiftCode(app, testInfo, modal);
+  test.skip(!code, "No gift card code entered in the popup");
+  let paid = await applyGiftCode(app, testInfo, modal, code!, { onRefused: tries > 1 ? "continue" : "skip" });
+  for (let attempt = 2; paid.after >= paid.before && attempt <= tries; attempt++) {
+    code = await askGiftCode(app, testInfo, modal);
+    test.skip(!code, "The gift card code was refused and no other code was entered in the popup");
+    paid = await applyGiftCode(app, testInfo, modal, code, { onRefused: attempt < tries ? "continue" : "skip" });
+  }
+  return { code: code!, ...paid };
 }
 
 /**
@@ -863,6 +914,9 @@ export const REFUND_TIERS = [
 export const refundPercentFor = (minutesBeforeStart: number): number =>
   (REFUND_TIERS.find((t) => minutesBeforeStart >= t.minMinutes) ?? REFUND_TIERS[REFUND_TIERS.length - 1]).percent;
 
+/** The cancel popup's refund lines: amount per way of payment (only the ones shown). */
+export type RefundLines = Partial<Record<"Card" | "Gift card" | "Wallet", number>>;
+
 /** Minutes from now until `b` starts, in the location's time zone. */
 export function minutesUntilStart(app: BookingApp, b: CreatedBooking): number {
   const days = compareDates(b.date, todayIn(app.tz)) / 86_400_000;
@@ -896,7 +950,7 @@ export async function openCancelDialog(app: BookingApp, b: CreatedBooking): Prom
  *  - nothing due: the "non-refundable" notice and no "Total refund"
  * Returns the expected percent and amount (also noted in the report).
  */
-export async function expectRefundShown(app: BookingApp, testInfo: TestInfo, cancel: Locator, b: CreatedBooking) {
+export async function expectRefundShown(app: BookingApp, testInfo: TestInfo, cancel: Locator, b: CreatedBooking, refundLines?: RefundLines) {
   const minutes = minutesUntilStart(app, b);
   const percent = refundPercentFor(minutes);
   const booking = await app.fetchBooking(b.bookingId);
@@ -919,7 +973,7 @@ export async function expectRefundShown(app: BookingApp, testInfo: TestInfo, can
   if (amount > 0) {
     await expect(cancel, "refund total").toContainText(`Total refund (${percent}%)`);
     await expect(cancel, "refund amount").toContainText(`$${amount.toFixed(2)}`);
-    await expectRefundLines(cancel, booking, amount);
+    await expectRefundLines(cancel, booking, amount, refundLines);
     if (percent === 90) await expect(cancel).toContainText("Includes a 10% payment processing and digital service fee");
     await expect(cancel).toContainText("Refunds are processed automatically");
   } else {
@@ -936,7 +990,7 @@ export async function expectRefundShown(app: BookingApp, testInfo: TestInfo, can
  * so a booking paid by gift card + card can show only a "Gift card" line (e.g. 90% of $27 + $3 = $27, all to the
  * gift card) — a "Card" line is not required just because the card paid part of it.
  */
-async function expectRefundLines(cancel: Locator, booking: any, total: number) {
+async function expectRefundLines(cancel: Locator, booking: any, total: number, expected?: RefundLines) {
   const p = booking?.paymentBreakdown ?? {};
   const paidWith = {
     "Gift card": (p.giftCards ?? []).reduce((sum: number, g: any) => sum + Number(g.amount || 0), 0),
@@ -955,6 +1009,7 @@ async function expectRefundLines(cancel: Locator, booking: any, total: number) {
     expect(paidWith[line.method], `the ${line.method} refund line is a way the booking was paid (${JSON.stringify(p)})`).toBeGreaterThan(0);
   }
   expect(round2(lines.reduce((sum, l) => sum + l.amount, 0)), "the refund lines add up to the total refund").toBeCloseTo(total, 2);
+  if (expected) expect(Object.fromEntries(lines.map((l) => [l.method, l.amount])), "the refund line of each way of payment").toEqual(expected);
 }
 
 /** "Keep booking" in the cancel popup: it closes and the booking stays active. */
@@ -973,10 +1028,11 @@ export async function cancelInUi(
   app: BookingApp,
   testInfo: TestInfo,
   b: CreatedBooking,
-  { checkRefund = false, expectPercent }: { checkRefund?: boolean; expectPercent?: number } = {},
+  /** `refundLines`: the exact refund line per way of payment (implies checkRefund). */
+  { checkRefund = false, expectPercent, refundLines }: { checkRefund?: boolean; expectPercent?: number; refundLines?: RefundLines } = {},
 ) {
   const cancel = await openCancelDialog(app, b);
-  const expected = checkRefund || expectPercent !== undefined ? await expectRefundShown(app, testInfo, cancel, b) : null;
+  const expected = checkRefund || expectPercent !== undefined || refundLines ? await expectRefundShown(app, testInfo, cancel, b, refundLines) : null;
   if (expected && expectPercent !== undefined) {
     expect(expected.percent, `${expected.minutes} min before the start is the ${expectPercent}% tier`).toBe(expectPercent);
   }
@@ -1342,4 +1398,14 @@ async function moveWindow(pid: number | undefined, where: "top" | "behind") {
  */
 export function endTimeOption(app: BookingApp, endTime: string): Locator {
   return app.page.getByRole("option", { name: endTime, exact: true }).and(app.page.locator(":not([data-disabled])")).first();
+}
+
+/** Booking Details: End Time -> `hours` after the start (no second selection). Returns the longer selection. */
+export async function setBookingHours(app: BookingApp, modal: Locator, sel: SelectedBooking, hours: number): Promise<SelectedBooking> {
+  const endIdx = sel.startIdx + hours * 4 - 1;
+  const endTime = fromMinutes((endIdx + 1) * 15);
+  await app.guidedClick(modal.getByRole("combobox").nth(2)); // End Time
+  await app.guidedClick(endTimeOption(app, endTime), { read: app.readMs });
+  await expect(modal, "Booking Details shows the new time").toContainText(`${sel.startTime} - ${endTime}`);
+  return { ...sel, endIdx, endTime };
 }
