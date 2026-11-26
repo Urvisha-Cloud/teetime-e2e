@@ -1,29 +1,28 @@
 import type { TestInfo } from "@playwright/test";
-import type { BaySlotState, BookingApp, CreatedBooking, SelectedBooking } from "../support/booking-app";
-import { env } from "../support/env";
-import { fromMinutes } from "../support/time";
+import type { BaySlotState, BookingApp, CreatedBooking, SelectedBooking } from "../../support/booking-app";
+import { env } from "../../support/env";
+import { fromMinutes } from "../../support/time";
 import {
   bookFreeSlot,
   bookingSuite,
   bookSlot,
+  confirmNewBooking,
   expectConfirmed,
   formatMinutes,
   openExtendPopup,
-  orBlocked,
   requireBookingCreation,
   slotsAfterRequested,
-} from "./helper";
-import { expect, test } from "./fixtures";
+} from "../helper";
+import { expect, test } from "../fixtures";
 
 /**
  * Extend to another bay, the last card-paid part of npm test. Both cases: only 30 min free after the booking (another booking
  * starts then) -> Extend -> +30 min (the limit) -> a "book a new session" option -> pick a bay in the dropdown -> 1 hr
  * -> Continue -> Booking Details -> the new session on that bay is booked.
- *  TC100–102 "Switch bay, keep playing" (another bay of any kind)
- *  TC103–105 "Switch to Trackman" (the green promo; only offered when the booking is on an Impact Vision bay)
- * Kept in its own file because Playwright runs files in name order: "switch-…" sorts after booking-flow,
- * booking-reschedule and refund-cancel, so npm test runs it after those; the wallet, gift card and membership
- * cases (x-, y-, z-…) follow. Also part of npm run test:extend.
+ *  TC19–21 "Switch bay, keep playing" (another bay of any kind)
+ *  TC22–24 "Switch to Trackman" (the green promo; only offered when the booking is on an Impact Vision bay)
+ * Main run, the last card-paid step (tests/main.spec.ts runs it after the card flow, quick shift and refund cases; wallet,
+ * gift card and membership follow). npm run test:extend runs it alone.
  */
 
 const GAP = 2; // 30 min free after the first booking
@@ -151,16 +150,12 @@ async function bookNewSession(app: BookingApp, testInfo: TestInfo, next: Selecte
   if (await modal.isVisible().catch(() => false)) {
     await app.readPause();
     await app.selectGroupSize(modal, 1);
-    await app.scrollThrough(modal);
-    await app.acceptWaiver(modal);
-    await orBlocked(testInfo, () => app.preparePayment(modal));
-    const bookingId = await app.confirmBooking(modal, { read: Math.min(1500, app.readMs) });
-    testInfo.annotations.push({ type: "bookingId", description: bookingId });
-    booked = { ...next, bookingId, groupSize: 1 };
+    booked = await confirmNewBooking(app, testInfo, modal, next); // waiver, card, Confirm -> Booking Confirmed -> email
+    await app.readPause(env.showMs);
   } else {
     booked = await bookSlot(app, testInfo, next); // Book Now -> Booking Details -> …
+    await expectConfirmed(app, booked);
   }
-  await expectConfirmed(app, booked);
   await app.viewMyBooking(booked);
   // The first booking keeps its own time (not extended), the blocker is unchanged
   for (const b of unchanged) await app.verifyBookingOnCalendar(b);
@@ -169,20 +164,20 @@ async function bookNewSession(app: BookingApp, testInfo: TestInfo, next: Selecte
 
 // ───────────────────────────── Switch bay, keep playing ─────────────────────────────
 
-test.describe("Extend to another bay: Switch bay, keep playing @main @creates-booking", () => {
+test.describe("Extend to another bay: Switch bay, keep playing @card-switch-bay @creates-booking", () => {
   let app: BookingApp;
   const suite = bookingSuite((a) => (app = a), { watch: true });
   let first: CreatedBooking | undefined; // the booking we try to extend
   let blocker: CreatedBooking | undefined; // starts 30 min after it in the same bay
   let next: SelectedBooking | undefined; // the 1-hour session on the bay picked in the dropdown
 
-  test("TC100: book a free hour, then another booking in the same bay starting 30 min after it", async ({}, testInfo) => {
+  test("TC19: book a free hour, then another booking in the same bay starting 30 min after it", async ({}, testInfo) => {
     requireBookingCreation();
     ({ first, blocker } = await bookWithBlockerAfter(app, testInfo, (b) => suite.track(b)));
   });
 
-  test("TC101: Extend -> +30 min (the limit) -> Switch bay, keep playing -> pick a bay in the dropdown -> 1 hr -> Continue", async ({}, testInfo) => {
-    test.skip(!first || !blocker, "TC100 did not create both bookings");
+  test("TC20: Extend -> +30 min (the limit) -> Switch bay, keep playing -> pick a bay in the dropdown -> 1 hr -> Continue", async ({}, testInfo) => {
+    test.skip(!first || !blocker, "TC19 did not create both bookings");
     const f = first!;
     // Which other bays are free for the hour after the booking (what "Switch bay" can offer)
     const freeBays = (await app.baysForRange(f.endIdx + 1, f.endIdx + HOUR)).filter((x) => x.bayId !== f.bayId && x.free);
@@ -197,15 +192,15 @@ test.describe("Extend to another bay: Switch bay, keep playing @main @creates-bo
     next = await pickBayAndContinue(app, testInfo, f, "Switch bay, keep playing", freeBays);
   });
 
-  test("TC102: Booking Details -> group size, waiver, payment -> Confirm -> the new session on the other bay is booked", async ({}, testInfo) => {
-    test.skip(!next, "TC101 did not select the new session");
+  test("TC21: Booking Details -> group size, waiver, payment -> Confirm -> the new session on the other bay is booked", async ({}, testInfo) => {
+    test.skip(!next, "TC20 did not select the new session");
     suite.track(await bookNewSession(app, testInfo, next!, [first!, blocker!]));
   });
 });
 
 // ───────────────────────────── Switch to Trackman ─────────────────────────────
 
-test.describe("Extend to another bay: Switch to Trackman @main @creates-booking", () => {
+test.describe("Extend to another bay: Switch to Trackman @card-switch-bay @creates-booking", () => {
   let app: BookingApp;
   const suite = bookingSuite((a) => (app = a), { watch: true });
   let trackmanIds: string[] = [];
@@ -213,7 +208,7 @@ test.describe("Extend to another bay: Switch to Trackman @main @creates-booking"
   let blocker: CreatedBooking | undefined;
   let next: SelectedBooking | undefined; // the 1-hour session on the Trackman bay picked in the dropdown
 
-  test("TC103: book a free hour on an Impact Vision bay, then another booking in the same bay starting 30 min after it", async ({}, testInfo) => {
+  test("TC22: book a free hour on an Impact Vision bay, then another booking in the same bay starting 30 min after it", async ({}, testInfo) => {
     requireBookingCreation();
     await app.openIfNeeded();
     await app.loadLocations();
@@ -230,8 +225,8 @@ test.describe("Extend to another bay: Switch to Trackman @main @creates-booking"
     ({ first, blocker } = await bookWithBlockerAfter(app, testInfo, (b) => suite.track(b), notImpactVision));
   });
 
-  test("TC104: Extend -> +30 min (the limit) -> Switch to Trackman -> pick a Trackman bay in the dropdown -> 1 hr -> Continue", async ({}, testInfo) => {
-    test.skip(!first || !blocker, "TC103 did not create both bookings");
+  test("TC23: Extend -> +30 min (the limit) -> Switch to Trackman -> pick a Trackman bay in the dropdown -> 1 hr -> Continue", async ({}, testInfo) => {
+    test.skip(!first || !blocker, "TC22 did not create both bookings");
     const f = first!;
     // Trackman bays free for the hour after the booking
     const freeTrackman = (await app.baysForRange(f.endIdx + 1, f.endIdx + HOUR)).filter((x) => trackmanIds.includes(x.bayId) && x.free);
@@ -249,8 +244,8 @@ test.describe("Extend to another bay: Switch to Trackman @main @creates-booking"
     next = await pickBayAndContinue(app, testInfo, f, "Switch to Trackman", freeTrackman);
   });
 
-  test("TC105: Booking Details -> group size, waiver, payment -> Confirm -> the new session on the Trackman bay is booked", async ({}, testInfo) => {
-    test.skip(!next, "TC104 did not select the new session");
+  test("TC24: Booking Details -> group size, waiver, payment -> Confirm -> the new session on the Trackman bay is booked", async ({}, testInfo) => {
+    test.skip(!next, "TC23 did not select the new session");
     suite.track(await bookNewSession(app, testInfo, next!, [first!, blocker!]));
   });
 });

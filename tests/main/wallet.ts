@@ -1,7 +1,7 @@
 import type { TestInfo } from "@playwright/test";
-import type { BookingApp, CreatedBooking } from "../support/booking-app";
-import { env } from "../support/env";
-import { unwrap } from "../support/network";
+import type { BookingApp, CreatedBooking } from "../../support/booking-app";
+import { env } from "../../support/env";
+import { unwrap } from "../../support/network";
 import {
   GIFT_CODE_KEY_DELAY_MS,
   addPlayers,
@@ -11,50 +11,48 @@ import {
   chooseNewTime,
   confirmChangeDetails,
   continueExtend,
-  dueBeforeWallet,
   expectBookingGone,
-  expectConfirmed,
+  confirmNewBooking,
+  expectWalletBalance,
   openExtendPopup,
-  orBlocked,
   outsideCreditHours,
   presetSlots,
   requireBookingCreation,
   rescheduleSlotsRange,
   selectRequestedSlot,
-  showBookingEmail,
   startReschedule,
-} from "./helper";
-import { expect, test, testUser } from "./fixtures";
+} from "../helper";
+import { expect, test, testUser } from "../fixtures";
+import { dueBeforeWallet, paidWith, refundSplit, round2 } from "../money";
 
 /**
- * Test cases 107–110 and 133–136 — a booking paid with the wallet credit when there is some, otherwise by card. Wallet credit is
+ * Test cases 25–32 — a booking paid with the wallet credit when there is some, otherwise by card. Wallet credit is
  * applied by itself (My Wallet: "Credits auto-apply on your next booking"; Booking Details has no switch for it).
  *
- *  TC107  only when the wallet is empty: sidebar "My Wallet" -> "Redeem Gift" -> the "Redeem gift card" modal -> a popup
+ *  TC25  only when the wallet is empty: sidebar "My Wallet" -> "Redeem Gift" -> the "Redeem gift card" modal -> a popup
  *         asks YOU for the gift card code (e.g. from admin; headless runs use TEETIME_GIFT_CARD_CODE) -> the code is
  *         typed into "Gift code" -> Redeem -> the wallet balance goes up by the card's value -> back to "Book Your Bay".
- *         The wallet already has credit -> nothing to redeem (TC108 uses it). Popup "Skip" -> no redeem, TC108 pays by card.
- *         A refused code (used up, invalid) -> skipped with the app's message; TC108 then pays by card.
- *  TC108  book a free slot: opening Booking Details makes the app call GET /wallet/balance — that balance decides:
+ *         The wallet already has credit -> nothing to redeem (TC26 uses it). Popup "Skip" -> no redeem, TC26 pays by card.
+ *         A refused code (used up, invalid) -> skipped with the app's message; TC26 then pays by card.
+ *  TC26  book a free slot: opening Booking Details makes the app call GET /wallet/balance — that balance decides:
  *           credit  -> "Wallet credits" in the price, "You pay" = price − credit, the card pays the rest (if any)
  *           no credit -> no wallet line, "You pay" = the price, the card pays it all
  *         -> waiver -> Confirm -> Booking Confirmed
- *  TC109  the saved booking (paymentBreakdown): walletAmount = the credit used, cardAmount = the rest
- *  TC110  the wallet afterwards: balance = before − credit used (unchanged when none was used), and the wallet's
+ *  TC27  the saved booking (paymentBreakdown): walletAmount = the credit used, cardAmount = the rest
+ *  TC28  the wallet afterwards: balance = before − credit used (unchanged when none was used), and the wallet's
  *         history has a debit for THIS booking of the credit used (none when the card paid it all)
  *
- *  TC133–136  the same booking: reschedule -> group size -> extend -> cancel; every extra cost is paid by the wallet
+ *  TC29–32  the same booking: reschedule -> group size -> extend -> cancel; every extra cost is paid by the wallet
  *         first, then the card; the cancellation puts the wallet's part (less the fee) back
  *
- * File name "x-…": runs after every card-paid case (files run in name order), so the refund of this booking cannot
- * reach them; y-gift-card and z-membership follow.
+ * Runs after every card-paid case (the order of tests/main.spec.ts), so the refund of this booking cannot reach them;
+ * wallet + gift card, gift card and membership follow.
  */
 
-const round2 = (n: number) => Math.round(n * 100) / 100;
 /** The account the run is logged in as (the wallet belongs to it). */
 const testUserEmail = () => testUser.email ?? env.testEmail ?? "the test user";
 
-test.describe("Wallet credit, otherwise card: create -> reschedule -> group size -> extend -> cancel @main @creates-booking", () => {
+test.describe("Wallet credit, otherwise card: create -> reschedule -> group size -> extend -> cancel @wallet-credit @creates-booking", () => {
   let app: BookingApp;
   const suite = bookingSuite((a) => (app = a), { watch: true });
   let balanceBefore = 0; // what GET /wallet/balance said when Booking Details opened
@@ -66,17 +64,17 @@ test.describe("Wallet credit, otherwise card: create -> reschedule -> group size
   let extended = false;
   const extraSlots = presetSlots(env.extendBy);
 
-  test("TC107: empty wallet -> My Wallet -> Redeem Gift -> popup: enter the gift card code -> Redeem -> wallet balance goes up", async ({ headless }, testInfo) => {
+  test("TC25: empty wallet -> My Wallet -> Redeem Gift -> popup: enter the gift card code -> Redeem -> wallet balance goes up", async ({ headless }, testInfo) => {
     requireBookingCreation();
     await app.openIfNeeded();
     const start = await app.walletBalance();
     if (start > 0) {
-      const note = `the wallet already has $${start.toFixed(2)} for ${testUserEmail()}: nothing to redeem, TC108 uses it`;
+      const note = `the wallet already has $${start.toFixed(2)} for ${testUserEmail()}: nothing to redeem, TC26 uses it`;
       testInfo.annotations.push({ type: "wallet", description: note });
       console.log(`[teetime-e2e] wallet: ${note}`);
       return;
     }
-    test.skip(headless && !env.giftCardCode, "Empty wallet, headless run without TEETIME_GIFT_CARD_CODE: nothing to redeem (TC108 pays by card)");
+    test.skip(headless && !env.giftCardCode, "Empty wallet, headless run without TEETIME_GIFT_CARD_CODE: nothing to redeem (TC26 pays by card)");
     const page = app.page;
 
     // Sidebar "My Wallet" -> "Redeem Gift" -> the "Redeem gift card" modal
@@ -91,7 +89,7 @@ test.describe("Wallet credit, otherwise card: create -> reschedule -> group size
 
     // The popup asks YOU for the code (headless: TEETIME_GIFT_CARD_CODE) -> typed into "Gift code" -> Redeem
     const code = headless ? env.giftCardCode : await askGiftCode(app, testInfo, dialog, { primaryButton: redeem, target: '"Gift code"' });
-    test.skip(!code, "No gift card code entered in the popup: nothing redeemed (TC108 pays by card)");
+    test.skip(!code, "No gift card code entered in the popup: nothing redeemed (TC26 pays by card)");
     await app.guidedClick(field);
     await field.pressSequentially(code, { delay: GIFT_CODE_KEY_DELAY_MS });
     await app.guidedClick(redeem, { read: app.readMs });
@@ -104,7 +102,7 @@ test.describe("Wallet credit, otherwise card: create -> reschedule -> group size
         const why = (await refused.innerText()).trim();
         testInfo.annotations.push({ type: "gift-card", description: `${code}: ${why}` });
         await page.keyboard.press("Escape");
-        test.skip(true, `The gift card code ${code} cannot be redeemed ("${why}"): TC108 pays by card`);
+        test.skip(true, `The gift card code ${code} cannot be redeemed ("${why}"): TC26 pays by card`);
       }
       balance = await app.walletBalance();
       if (balance <= start) await page.waitForTimeout(500);
@@ -121,15 +119,15 @@ test.describe("Wallet credit, otherwise card: create -> reschedule -> group size
     await expect(page.getByText(`$${balance.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`).first(), "the new balance on My Wallet").toBeVisible({ timeout: 10_000 });
     await app.readPause();
 
-    // Back to the calendar for the booking (TC108)
+    // Back to the calendar for the booking (TC26)
     await app.guidedClick(page.getByText("Book Your Bay", { exact: true }).first());
   });
 
-  test("TC108: Booking Details checks the wallet balance -> wallet credit if there is some, otherwise card -> Booking Confirmed", async ({}, testInfo) => {
+  test("TC26: Booking Details checks the wallet balance -> wallet credit if there is some, otherwise card -> Booking Confirmed", async ({}, testInfo) => {
     requireBookingCreation();
     await app.openIfNeeded();
     const sel = await selectRequestedSlot(app, testInfo, [], {
-      // the same bay must be free for the reschedule and the extension (TC133, TC135); outside member credit hours
+      // the same bay must be free for the reschedule and the extension (TC29, TC31); outside member credit hours
       alsoFree: rescheduleSlotsRange(extraSlots),
       ...(await outsideCreditHours(app)),
     });
@@ -162,31 +160,22 @@ test.describe("Wallet credit, otherwise card: create -> reschedule -> group size
     else await expect(modal, "no wallet line without credit").not.toContainText(/Wallet credits/i);
     expect(await app.amountToPay(modal), `"You pay" = $${price.toFixed(2)} − $${used.toFixed(2)} wallet credit`).toBeCloseTo(cardPart, 2);
 
-    await app.scrollThrough(modal);
-    await app.acceptWaiver(modal);
-    if (cardPart > 0) await orBlocked(testInfo, () => app.preparePayment(modal)); // the card pays the rest / all of it
-    const bookingId = await app.confirmBooking(modal, { read: Math.min(1500, app.readMs) });
-    testInfo.annotations.push({ type: "bookingId", description: bookingId });
-    booking = { ...sel, bookingId, groupSize: 1 };
-    suite.track(booking);
-    await expectConfirmed(app, booking, { pause: false });
-    await showBookingEmail(app, testInfo, booking, "confirmed");
+    // waiver -> the card pays the rest / all of it -> Confirm -> Booking Confirmed -> the booking email
+    booking = await confirmNewBooking(app, testInfo, modal, sel, { track: suite.track });
   });
 
-  test("TC109: the saved booking is paid as Booking Details showed: wallet credit + card", async ({}, testInfo) => {
-    test.skip(!booking, "TC108 did not create the booking");
+  test("TC27: the saved booking is paid as Booking Details showed: wallet credit + card", async ({}, testInfo) => {
+    test.skip(!booking, "TC26 did not create the booking");
     const p = (await app.fetchBooking(booking!.bookingId))?.paymentBreakdown ?? {};
     testInfo.annotations.push({ type: "paymentBreakdown", description: JSON.stringify(p).slice(0, 300) });
     expect(Number(p.walletAmount || 0), "paid from the wallet").toBeCloseTo(used, 2);
     expect(Number(p.cardAmount || 0), "paid by card").toBeCloseTo(cardPart, 2);
   });
 
-  test("TC110: the wallet afterwards: down by the credit used (unchanged without credit)", async ({}, testInfo) => {
-    test.skip(!booking, "TC108 did not create the booking");
+  test("TC28: the wallet afterwards: down by the credit used (unchanged without credit)", async ({}, testInfo) => {
+    test.skip(!booking, "TC26 did not create the booking");
     const expected = round2(balanceBefore - used);
-    await expect
-      .poll(async () => round2(await app.walletBalance()), { message: `wallet balance = $${balanceBefore.toFixed(2)} − $${used.toFixed(2)}`, timeout: 20_000 })
-      .toBe(expected);
+    await expectWalletBalance(app, expected, `wallet balance = $${balanceBefore.toFixed(2)} − $${used.toFixed(2)}`);
     // The history comes in pages (the newest 20), so look for THIS booking's entry instead of counting entries
     const transactions = await app.walletTransactions();
     const forBooking = transactions.filter((t: any) => t.referenceType === "booking" && t.referenceId === booking!.bookingId);
@@ -208,10 +197,7 @@ test.describe("Wallet credit, otherwise card: create -> reschedule -> group size
    * wallet first, as far as it goes, the card the rest — and the wallet went down by exactly its part.
    */
   async function changePaidByWallet(testInfo: TestInfo, what: string, change: () => Promise<CreatedBooking>) {
-    const paid = async () => {
-      const p = (await app.fetchBooking(booking!.bookingId))?.paymentBreakdown ?? {};
-      return { wallet: Number(p.walletAmount || 0), card: Number(p.cardAmount || 0) };
-    };
+    const paid = async () => paidWith(await app.fetchBooking(booking!.bookingId));
     const wallet = await app.walletBalance();
     const before = await paid();
     booking = await change();
@@ -222,15 +208,13 @@ test.describe("Wallet credit, otherwise card: create -> reschedule -> group size
     testInfo.annotations.push({ type: "payment", description: note });
     console.log(`[teetime-e2e] wallet: ${note}`);
     expect(fromWallet, `${what}: the wallet pays first, as far as it goes`).toBeCloseTo(Math.min(wallet, round2(fromWallet + fromCard)), 2);
-    await expect
-      .poll(async () => round2(await app.walletBalance()), { message: `${what}: wallet balance down by what it paid`, timeout: 20_000 })
-      .toBe(round2(wallet - fromWallet));
+    await expectWalletBalance(app, wallet - fromWallet, `${what}: wallet balance down by what it paid`);
     await app.viewMyBooking(booking);
   }
 
-  test("TC133: reschedule the wallet booking -> the 2 hr after it -> wallet credit pays the difference, the card the rest -> calendar", async ({}, testInfo) => {
-    test.skip(!booking, "TC108 did not create the booking");
-    await app.viewMyBooking(booking!); // TC108 left the Booking Confirmed screen open
+  test("TC29: reschedule the wallet booking -> the 2 hr after it -> wallet credit pays the difference, the card the rest -> calendar", async ({}, testInfo) => {
+    test.skip(!booking, "TC26 did not create the booking");
+    await app.viewMyBooking(booking!); // TC26 left the Booking Confirmed screen open
     await changePaidByWallet(testInfo, "reschedule", async () => {
       await startReschedule(app, booking!);
       const next = await chooseNewTime(app, booking!, env.rescheduleStart, env.rescheduleEnd);
@@ -240,8 +224,8 @@ test.describe("Wallet credit, otherwise card: create -> reschedule -> group size
     rescheduled = true;
   });
 
-  test(`TC134: update the group size of the wallet booking -> ${env.groupSizeUpdate} players -> calendar`, async ({}, testInfo) => {
-    test.skip(!rescheduled, "TC133 did not reschedule the booking");
+  test(`TC30: update the group size of the wallet booking -> ${env.groupSizeUpdate} players -> calendar`, async ({}, testInfo) => {
+    test.skip(!rescheduled, "TC29 did not reschedule the booking");
     await changePaidByWallet(testInfo, "group size", async () => {
       const next = await addPlayers(app, booking!, env.groupSizeUpdate);
       await confirmChangeDetails(app, testInfo, "reschedule", next);
@@ -250,8 +234,8 @@ test.describe("Wallet credit, otherwise card: create -> reschedule -> group size
     resized = true;
   });
 
-  test(`TC135: extend the wallet booking -> ${env.extendBy} -> calendar`, async ({}, testInfo) => {
-    test.skip(!resized, "TC134 did not update the group size");
+  test(`TC31: extend the wallet booking -> ${env.extendBy} -> calendar`, async ({}, testInfo) => {
+    test.skip(!resized, "TC30 did not update the group size");
     await changePaidByWallet(testInfo, "extend", async () => {
       const popup = await openExtendPopup(app, booking!);
       await app.guidedClick(popup.getByRole("button", { name: env.extendBy, exact: true }));
@@ -262,22 +246,16 @@ test.describe("Wallet credit, otherwise card: create -> reschedule -> group size
     extended = true;
   });
 
-  test("TC136: cancel the wallet booking -> refund shown and applied -> the wallet's part is back in the wallet -> slots free", async ({}, testInfo) => {
-    test.skip(!extended, "TC135 did not extend the booking");
+  test("TC32: cancel the wallet booking -> refund shown and applied -> the wallet's part is back in the wallet -> slots free", async ({}, testInfo) => {
+    test.skip(!extended, "TC31 did not extend the booking");
     const wallet = await app.walletBalance();
-    const p = (await app.fetchBooking(booking!.bookingId))?.paymentBreakdown ?? {};
-    await cancelInUi(app, testInfo, booking!, { checkRefund: true });
+    const paid = paidWith(await app.fetchBooking(booking!.bookingId));
+    const refund = await cancelInUi(app, testInfo, booking!, { checkRefund: true });
     suite.markCancelled();
-    const refunded = Number((await app.fetchBooking(booking!.bookingId))?.metadata?.refundAmount ?? 0);
-    // The fee is taken from the card first, then the wallet; what is left of the wallet's part comes back to it
-    const card = Number(p.cardAmount || 0);
-    const paidWallet = Number(p.walletAmount || 0);
-    const fee = round2(card + paidWallet - refunded);
-    const back = round2(paidWallet - Math.max(0, round2(fee - card)));
-    testInfo.annotations.push({ type: "wallet", description: `refund to the wallet: $${back.toFixed(2)} of $${paidWallet.toFixed(2)}` });
-    await expect
-      .poll(async () => round2(await app.walletBalance()), { message: `wallet balance = $${wallet.toFixed(2)} + $${back.toFixed(2)}`, timeout: 20_000 })
-      .toBe(round2(wallet + back));
+    // The fee is taken from the card first (then gift card, wallet): what is left of the wallet's part comes back to it
+    const back = refundSplit(paid, refund!.percent).wallet;
+    testInfo.annotations.push({ type: "wallet", description: `refund to the wallet: $${back.toFixed(2)} of $${paid.wallet.toFixed(2)}` });
+    await expectWalletBalance(app, wallet + back, `wallet balance = $${wallet.toFixed(2)} + $${back.toFixed(2)}`);
     await expectBookingGone(app, booking!);
   });
 });

@@ -12,12 +12,29 @@ It must always match `package.json` and the tests. Update it **in the same chang
 
 | You changed | Update in COMMANDS.md |
 |---|---|
-| Added a test case (new `TCxx`) | Add a row to **Single tests** (TC, file, what it checks, real booking). Update the test counts in **Run groups** (e.g. "Everything (24 tests)"). |
+| Added a test case (new `TCxx`) | Add a row to **Single tests** (TC, file, what it checks, real booking). Update the counts ("The 57 cases of `npm test`"). |
 | Added a spec file | Add a row to **Run groups** if it gets its own npm script; add its tests to **Single tests**. |
 | Added / renamed / removed an npm script | Add / rename / remove its row in **Run groups** (or **Setup**, **Reports and debugging**). |
 | Changed what a command runs | Fix the "What it runs" and "Real booking" cells. |
-| A test now creates (or stops creating) a booking | Fix the "Real booking" cells, the `@creates-booking` notes, and `test:booking` / `test:readonly` rows. |
+| A test now creates (or stops creating) a booking | Fix the "Real booking" cells. |
 | Changed login or settings (`.env`) | Update **Good to know**. |
+
+## The main run (`npm test`)
+
+* `npm test` runs **`tests/main.spec.ts`**, the only spec file. It imports the step files of `tests/main` in run order
+  (`card-flow`, `card-quick-shift`, `card-refund`, `card-switch-bay`, `wallet`, `wallet-gift-card`, `gift-card`,
+  `membership`): the imports set the order, not the file names. The step files end in `.ts`, not `.spec.ts`, so
+  Playwright never runs them a second time on their own.
+* Each step's `test.describe` titles carry its tag (`@card-flow`, `@card-quick-shift`, `@card-refund`,
+  `@card-switch-bay`, `@wallet-credit`, `@wallet-gift-card`, `@gift-card`, `@membership`). A step command is
+  `playwright test tests/main.spec.ts --grep @<tag> --headed`. A tag must not be part of another tag (that is why the
+  wallet step is `@wallet-credit`, not `@wallet`).
+* A new case for the main run goes into the file of its step: it is in `npm test` by itself. A new step is a new file
+  in `tests/main` with its own tag, imported in `tests/main.spec.ts` at its place. Both still need their **Single
+  tests** rows and the main-run row's description in COMMANDS.md.
+* Files in `tests/main` import one folder up: `../helper`, `../fixtures`, `../money`, `../../support/…`.
+* Every case is part of the main run: the suite has only `tests/main` (TC1–TC57, numbered in run order). A new case
+  gets the next free number, or the cases after it are renumbered so the numbers keep following the run order.
 
 ## Table format (keep it)
 
@@ -30,19 +47,16 @@ It must always match `package.json` and the tests. Update it **in the same chang
   **npx** column the same command in full — the exact value of that script with `npx ` in front (`node …` and
   `npm ci` as they are). No npm script for a command: "—" in the npm column. Commands in backticks. Escape `|` inside
   table cells as `\|` (e.g. in `--grep "A\|B"`) — in BOTH places, or the table breaks.
-* Real booking column: `No`, `Yes`, `No (mocked)`, `Request only` (real create request, booking deleted again by the
-  backend), or `(TC11's)` for steps that reuse another test's booking.
+* Real booking column: `No`, `Yes`, or `(TC2's)` for steps that reuse another test's booking.
 
 ## Rules for new commands
 
 * Add a `package.json` script for anything run more than once (a shortcut: `npm run <name>`), and document it in
   COMMANDS.md with both forms: `npm run <name>` and its `npx playwright test …` command.
-  Name it `test:<area>` (e.g. `test:payment`). **Every test script must include `--headed`** (or `--ui`): the user
+  Name it `test:<area>` (e.g. `test:wallet`). **Every test script must include `--headed`** (or `--ui`): the user
   always watches the tests in a visible Chrome window.
-* Exception: the unattended daily run (`run-readonly.cmd`, Task Scheduler) calls `npx playwright test …` directly
-  without `--headed`, so no window pops up. Don't point it at an npm script.
 * Never document `npm playwright …` — it is not valid. Use `npx playwright …` or an npm script.
-* Extra options go at the end of the npx command: `npx playwright test tests/payment-negative.spec.ts --headed --debug`.
+* Extra options go at the end of the npx command: `npx playwright test tests/main.spec.ts --grep @wallet-credit --headed --debug`.
 
 ## Checking
 

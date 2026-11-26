@@ -2,10 +2,11 @@ import type { Locator, TestInfo } from "@playwright/test";
 import { spawn, type ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
-import { BlockedError, BookingApp, annotateBlocked, type CreatedBooking, type SelectedBooking } from "../support/booking-app";
+import { BlockedError, BookingApp, annotateBlocked, type CalendarGrid, type CreatedBooking, type SelectedBooking } from "../support/booking-app";
 import { bookingCreationBlockedReason, env } from "../support/env";
-import { type LocalDate, addDays, compareDates, fromMinutes, headerLabel, isoDate, nowMinutesIn, pad12, slotRange, todayIn, toMinutes } from "../support/time";
+import { type LocalDate, addDays, compareDates, fromMinutes, headerLabel, isoDate, nowMinutesIn, slotRange, todayIn, toMinutes } from "../support/time";
 import { expect, test, testUser } from "./fixtures";
+import { type RefundSplit, paidWith, refundSplit, round2 } from "./money";
 
 type StripeCard = Parameters<BookingApp["enterCard"]>[1];
 type ChangeKind = "reschedule" | "extend";
@@ -168,10 +169,13 @@ export async function selectRequestedSlot(
     await test.step(`Go to booking date (+${env.daysAhead} day)`, async () => {
       await app.goToDate(date);
     });
-    const freeBay = (start: number) => {
+    // The day's calendar, read once per day: every start time below is checked against it in memory
+    let grid: CalendarGrid | undefined;
+    const freeBay = async (start: number) => {
       setPlan(start);
       const extra = alsoFree && { startIdx: start + alsoFree.from, endIdx: start + alsoFree.to };
-      return app.findAvailableBay(date, excludeBayIds, extra).catch((e) => {
+      grid ??= await app.readGrid();
+      return app.findAvailableBay(date, excludeBayIds, extra, grid).catch((e) => {
         if (e instanceof BlockedError) return e;
         throw e;
       });
@@ -219,6 +223,7 @@ export async function selectRequestedSlot(
         );
         date = addDays(date, 1);
         await app.goToDate(date);
+        grid = undefined; // another day: read its calendar again
       }
     });
   });
@@ -344,24 +349,23 @@ async function waitForWallet(
 
 /** The saved booking is paid by card alone: nothing from the wallet, gift cards or member credit. */
 export async function expectPaidByCard(app: BookingApp, testInfo: TestInfo, b: CreatedBooking) {
-  const p = (await app.fetchBooking(b.bookingId))?.paymentBreakdown ?? {};
-  testInfo.annotations.push({ type: "paymentBreakdown", description: JSON.stringify(p).slice(0, 300) });
-  const gifts = (p.giftCards ?? []).reduce((sum: number, g: any) => sum + Number(g.amount || 0), 0);
-  expect(Number(p.walletAmount || 0), "card only: nothing from the wallet").toBe(0);
-  expect(gifts, "card only: nothing from a gift card").toBe(0);
-  expect(Number(p.membershipCreditAmount || 0), "card only: no member credit").toBe(0);
-  expect(Number(p.cardAmount || 0), "card only: the card paid").toBeGreaterThan(0);
+  const booking = await app.fetchBooking(b.bookingId);
+  testInfo.annotations.push({ type: "paymentBreakdown", description: JSON.stringify(booking?.paymentBreakdown ?? {}).slice(0, 300) });
+  const paid = paidWith(booking);
+  expect(paid.wallet, "card only: nothing from the wallet").toBe(0);
+  expect(paid.gift, "card only: nothing from a gift card").toBe(0);
+  expect(paid.credit, "card only: no member credit").toBe(0);
+  expect(paid.card, "card only: the card paid").toBeGreaterThan(0);
 }
 
-/** What Booking Details charges before the wallet and the gift card (group size 1): session price − member credit − member discount. */
-export function dueBeforeWallet(modalText: string): number {
-  const amount = (re: RegExp) => Number((modalText.match(re)?.[1] ?? "0").replace(/,/g, ""));
-  const price =
-    amount(/Session price after discounts\s*\$(\d+(?:,\d{3})*\.\d{2})/) || amount(/Session price\s*\$(\d+(?:,\d{3})*\.\d{2})/);
-  if (!price) throw new Error(`No session price in Booking Details: ${modalText.slice(0, 300)}`);
-  const credit = amount(/Membership credit\s*[–-]\s*\$(\d+(?:,\d{3})*\.\d{2})/);
-  const discount = amount(/Member discount(?:\s*\(\d+% off\))?\s*[–-]\s*\$(\d+(?:,\d{3})*\.\d{2})/);
-  return round2(price - credit - discount);
+/** The wallet balance reaches `expected` (the backend books wallet payments and refunds a moment later). */
+export async function expectWalletBalance(app: BookingApp, expected: number, message: string) {
+  await expect.poll(async () => round2(await app.walletBalance()), { message, timeout: 20_000 }).toBe(round2(expected));
+}
+
+/** The balance left on gift card `code` reaches `expected`. */
+export async function expectGiftCardBalance(app: BookingApp, code: string, expected: number, message: string) {
+  await expect.poll(() => app.giftCardBalance(code), { message, timeout: 20_000 }).toBe(round2(expected));
 }
 
 // ───────────────────────────── create ─────────────────────────────
@@ -383,6 +387,30 @@ export async function fillBookingModal(
   await app.acceptWaiver(modal);
   await orBlocked(testInfo, () => (card ? app.enterCard(modal, card) : app.preparePayment(modal)));
   return modal;
+}
+
+/**
+ * Booking Details is ready (group size picked, wallet / gift card / member credit applied by the test): scroll to the
+ * waiver -> tick it -> the card pays what is left, if anything -> Confirm -> Booking Confirmed -> the booking email.
+ * `track` gets the booking as soon as it exists, so the suite cancels it afterwards even when the test stops early.
+ */
+export async function confirmNewBooking(
+  app: BookingApp,
+  testInfo: TestInfo,
+  modal: Locator,
+  sel: SelectedBooking,
+  { groupSize = 1, track }: { groupSize?: number; track?: (b: CreatedBooking) => void } = {},
+): Promise<CreatedBooking> {
+  await app.scrollThrough(modal);
+  await app.acceptWaiver(modal);
+  if ((await app.amountToPay(modal)) > 0) await orBlocked(testInfo, () => app.preparePayment(modal));
+  const bookingId = await app.confirmBooking(modal, { read: Math.min(1500, app.readMs) });
+  testInfo.annotations.push({ type: "bookingId", description: bookingId });
+  const booking = { ...sel, bookingId, groupSize };
+  track?.(booking);
+  await expectConfirmed(app, booking, { pause: false });
+  await showBookingEmail(app, testInfo, booking, "confirmed");
+  return booking;
 }
 
 /** Fill the Booking Details modal and Confirm: POST /booking/:locationId/:bayId -> Booking Confirmed screen. */
@@ -901,7 +929,7 @@ export async function continueExtend(app: BookingApp, popup: Locator, b: Created
 // ───────────────────────────── refund policy ─────────────────────────────
 // The cancellation refund rules, the same as the backend (getRefundPercentByTime) and the "How refunds work" list in
 // the cancel popup (CancellationPolicyModal). New cancel scenarios reuse these: book a slot, openCancelDialog(),
-// expectRefundShown(), then cancelInUi() or keepBooking().
+// expectRefundShown(), then cancelInUi().
 
 /** Refund tiers, highest first: from `minMinutes` before the start, `percent` of what was paid comes back. */
 export const REFUND_TIERS = [
@@ -923,15 +951,6 @@ export function minutesUntilStart(app: BookingApp, b: CreatedBooking): number {
   return days * 24 * 60 + toMinutes(b.startTime) - nowMinutesIn(app.tz);
 }
 
-/** What the booking was paid with, in total: card + wallet + gift cards + membership credit (paymentBreakdown). */
-export function paidTotal(booking: any): number {
-  const p = booking?.paymentBreakdown;
-  if (!p) return Number(booking?.paidAmount || 0);
-  const gifts = (p.giftCards || []).reduce((sum: number, g: any) => sum + Number(g.amount || 0), 0);
-  return Number(p.cardAmount || 0) + Number(p.walletAmount || 0) + gifts + Number(p.membershipCreditAmount || 0);
-}
-
-const round2 = (n: number) => Math.round(n * 100) / 100;
 
 /** ⋮ -> Cancel booking: the cancel popup (booking, refund, policy), not confirmed yet. */
 export async function openCancelDialog(app: BookingApp, b: CreatedBooking): Promise<Locator> {
@@ -954,8 +973,9 @@ export async function expectRefundShown(app: BookingApp, testInfo: TestInfo, can
   const minutes = minutesUntilStart(app, b);
   const percent = refundPercentFor(minutes);
   const booking = await app.fetchBooking(b.bookingId);
-  const paid = paidTotal(booking);
-  const amount = round2((paid * percent) / 100);
+  const split = refundSplit(paidWith(booking), percent);
+  const paid = paidWith(booking).total;
+  const amount = split.total;
   testInfo.annotations.push({ type: "refund", description: `${minutes} min before start: ${percent}% of $${paid.toFixed(2)} = $${amount.toFixed(2)}` });
 
   // The policy list
@@ -973,7 +993,7 @@ export async function expectRefundShown(app: BookingApp, testInfo: TestInfo, can
   if (amount > 0) {
     await expect(cancel, "refund total").toContainText(`Total refund (${percent}%)`);
     await expect(cancel, "refund amount").toContainText(`$${amount.toFixed(2)}`);
-    await expectRefundLines(cancel, booking, amount, refundLines);
+    await expectRefundLines(cancel, booking, split, refundLines);
     if (percent === 90) await expect(cancel).toContainText("Includes a 10% payment processing and digital service fee");
     await expect(cancel).toContainText("Refunds are processed automatically");
   } else {
@@ -981,23 +1001,27 @@ export async function expectRefundShown(app: BookingApp, testInfo: TestInfo, can
     await expect(cancel, "no refund total").not.toContainText("Total refund");
   }
   await app.readPause();
-  return { percent, amount, minutes, paid };
+  return { percent, amount, minutes, paid, split };
 }
 
 /**
  * The cancel popup's refund lines, one per way the money goes back ("Gift card $27.00", "Card $3.00", "Wallet …"):
- * each is a way the booking was paid, and together they make the total refund. The app refunds a gift card first,
- * so a booking paid by gift card + card can show only a "Gift card" line (e.g. 90% of $27 + $3 = $27, all to the
- * gift card) — a "Card" line is not required just because the card paid part of it.
+ * each is a way the booking was paid, and together they make the total refund. The fee is taken from the card first
+ * (refundSplit), so a booking paid by gift card + card can show only a "Gift card" line (e.g. 90% of $27 + $3 = $27,
+ * all to the gift card). Without member credit (which has its own line) every line must be exactly the split's
+ * amount; `expected` overrides that.
  */
-async function expectRefundLines(cancel: Locator, booking: any, total: number, expected?: RefundLines) {
+async function expectRefundLines(cancel: Locator, booking: any, split: RefundSplit, expected?: RefundLines) {
+  const total = split.total;
   const p = booking?.paymentBreakdown ?? {};
-  const paidWith = {
-    "Gift card": (p.giftCards ?? []).reduce((sum: number, g: any) => sum + Number(g.amount || 0), 0),
-    Wallet: Number(p.walletAmount || 0),
-    // No paymentBreakdown (older bookings): everything was paid by card
-    Card: Number(booking?.paymentBreakdown ? p.cardAmount || 0 : booking?.paidAmount || 0),
-  } as Record<string, number>;
+  const paid = paidWith(booking);
+  const paidWithLine = { "Gift card": paid.gift, Wallet: paid.wallet, Card: paid.card } as Record<string, number>;
+  if (!expected && paid.credit === 0) {
+    expected = {};
+    if (split.card > 0) expected.Card = split.card;
+    if (split.wallet > 0) expected.Wallet = split.wallet;
+    if (split.gift > 0) expected["Gift card"] = split.gift;
+  }
   const text = await cancel.innerText();
   const refundPart = text.slice(text.indexOf("Total refund"));
   const lines = [...refundPart.matchAll(/^\s*(Gift card|Wallet[^\n$]*|Card)\s*\n?\s*\$(\d+(?:,\d{3})*\.\d{2})/gim)].map((m) => ({
@@ -1006,17 +1030,10 @@ async function expectRefundLines(cancel: Locator, booking: any, total: number, e
   }));
   expect(lines.length, `refund lines in the cancel popup (${refundPart.slice(0, 200).replace(/\s+/g, " ")})`).toBeGreaterThan(0);
   for (const line of lines) {
-    expect(paidWith[line.method], `the ${line.method} refund line is a way the booking was paid (${JSON.stringify(p)})`).toBeGreaterThan(0);
+    expect(paidWithLine[line.method], `the ${line.method} refund line is a way the booking was paid (${JSON.stringify(p)})`).toBeGreaterThan(0);
   }
   expect(round2(lines.reduce((sum, l) => sum + l.amount, 0)), "the refund lines add up to the total refund").toBeCloseTo(total, 2);
   if (expected) expect(Object.fromEntries(lines.map((l) => [l.method, l.amount])), "the refund line of each way of payment").toEqual(expected);
-}
-
-/** "Keep booking" in the cancel popup: it closes and the booking stays active. */
-export async function keepBooking(app: BookingApp, cancel: Locator, b: CreatedBooking) {
-  await app.guidedClick(cancel.getByRole("button", { name: "Keep booking", exact: true }), { read: app.readMs });
-  await expect(cancel).toBeHidden();
-  expect(await app.myActiveBookingIds(), "the booking is still active").toContain(b.bookingId);
 }
 
 /**
@@ -1028,7 +1045,7 @@ export async function cancelInUi(
   app: BookingApp,
   testInfo: TestInfo,
   b: CreatedBooking,
-  /** `refundLines`: the exact refund line per way of payment (implies checkRefund). */
+  /** `refundLines`: the exact refund line per way of payment (implies checkRefund). Returns the refund checked, if any. */
   { checkRefund = false, expectPercent, refundLines }: { checkRefund?: boolean; expectPercent?: number; refundLines?: RefundLines } = {},
 ) {
   const cancel = await openCancelDialog(app, b);
@@ -1060,6 +1077,7 @@ export async function cancelInUi(
   await expect(app.page.getByText("Booking cancelled")).toBeVisible();
   await expect(cancel).toBeHidden();
   await showBookingEmail(app, testInfo, b, "cancelled"); // YopMail window on top: the cancellation email, then behind
+  return expected;
 }
 
 /** The cancelled booking is gone: no longer active for the user, and its slots on the calendar are free again. */
@@ -1114,15 +1132,6 @@ export function extendEndLabel(base: CreatedBooking, slots: number): string {
 
 /** The extra time the popup opens with: 30 min, or 15 min when only that is free (ExtendBookingModal defaultExtendSlots). */
 export const defaultExtendSlots = (max: number) => Math.max(1, Math.min(2, max));
-
-/** From the time the popup opens with to `slots`, with the + / − buttons. */
-export async function stepExtendTo(app: BookingApp, popup: Locator, base: CreatedBooking, slots: number) {
-  const start = defaultExtendSlots(Number(await slider(popup).getAttribute("max")));
-  await expectExtendSelection(popup, base, start);
-  const button = popup.getByRole("button", { name: slots > start ? "Add 15 minutes" : "Remove 15 minutes" });
-  for (let i = 0; i < Math.abs(slots - start); i++) await app.guidedClick(button);
-  await expectExtendSelection(popup, base, slots);
-}
 
 const slider = (popup: Locator) => popup.getByRole("slider", { name: "Additional time" });
 
@@ -1281,6 +1290,7 @@ export async function showBookingEmail(app: BookingApp, testInfo: TestInfo, b: C
   const email = (testUser.email ?? env.testEmail).toLowerCase();
   if (!email.endsWith("@yopmail.com")) return skip(`the test user ${email || "(none)"} is not a YopMail address`);
   if (testInfo.project.use.headless !== false) return skip("visible runs only (--headed)");
+  if (!env.showEmails) return skip(env.fast ? "fast run" : "TEETIME_SHOW_EMAILS=false");
   const chrome = chromeApp();
   if (!chrome) return skip("Google Chrome not found");
 

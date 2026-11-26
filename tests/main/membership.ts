@@ -1,25 +1,25 @@
 import type { Locator, TestInfo } from "@playwright/test";
-import type { BookingApp, CreatedBooking, SelectedBooking } from "../support/booking-app";
-import { env } from "../support/env";
-import { type LocalDate, compareDates, headerLabel, isoDate, pad12, todayIn } from "../support/time";
+import type { BookingApp, CreatedBooking, SelectedBooking } from "../../support/booking-app";
+import { env } from "../../support/env";
+import { type LocalDate, compareDates, headerLabel, isoDate, pad12, todayIn } from "../../support/time";
 import {
   bookingSuite,
   cancelInUi,
   clickAndExpectPatch,
+  confirmNewBooking,
   expectBookingGone,
-  expectConfirmed,
   expectRefundShown,
   minutesUntilStart,
-  orBlocked,
   refundPercentFor,
   requireBookingCreation,
   selectRequestedSlot,
   showBookingEmail,
-} from "./helper";
-import { expect, test, testUser } from "./fixtures";
+} from "../helper";
+import { expect, test, testUser } from "../fixtures";
+import { creditLine, discountLine, giftTotal, paidWith, refundSplit, round2, sessionPrice } from "../money";
 
 /**
- * Test cases 116–121 — Core membership: join, a booking paid with member credit (checked on the Membership tab, then
+ * Test cases 41–46 — Core membership: join, a booking paid with member credit (checked on the Membership tab, then
  * cancelled), then a booking with the member discount (no credit), cancelled too. Runs as the run's logged-in test
  * user (it stays a Core member afterwards).
  *
@@ -28,29 +28,28 @@ import { expect, test, testUser } from "./fixtures";
  * whatever the credit does not pay gets the member discount (Core: 10%, "Member discount (10% off)" line). There is
  * no switch to leave the credit out, so the discount-only booking is made after 3 PM, when credit hours are over.
  *
- *  TC116  sidebar "Membership" -> "Join Core" -> Join Core popup (saved card) -> "Pay $99" -> POST /membership/subscribe
+ *  TC41  sidebar "Membership" -> "Join Core" -> Join Core popup (saved card) -> "Pay $99" -> POST /membership/subscribe
  *         -> "Welcome to Core!" -> the page shows the active Core card (credit $x / $150); GET /membership/me: active.
  *         Already an active member -> nothing to buy, the membership is checked as it is.
- *  TC117  booking 1: the first day with credit hours left (days where the user's other bookings already used the
+ *  TC42  booking 1: the first day with credit hours left (days where the user's other bookings already used the
  *         2 credit hours are skipped: GET /membership/me creditUsage) and a bay free 1 PM – 3 PM (1 hr) -> Booking Details: "Membership
  *         credit" pays it -> Confirm -> Booking Confirmed -> YopMail: the booking email -> saved
  *         paymentBreakdown.membershipCreditAmount = the credit shown -> "View My Booking": back to the calendar
- *  TC118  sidebar "Membership": the Core card shows the balance − the credit used and "$x used this month"; the
+ *  TC43  sidebar "Membership": the Core card shows the balance − the credit used and "$x used this month"; the
  *         newest credit history entry is "Used on a booking −$credit" -> "Book Your Bay": back to the calendar, moved
  *         to booking 1's day (the booking is shown there)
- *  TC119  cancel booking 1 (normal cancel flow) -> "Booking cancelled" -> its slots free; the credit balance goes up by
+ *  TC44  cancel booking 1 (normal cancel flow) -> "Booking cancelled" -> its slots free; the credit balance goes up by
  *         the refund policy's share of the credit it used (90% more than 4 h before the start, 50% 1–4 h, none within
  *         1 h; e.g. $10 credit cancelled a day ahead -> $9 back)
- *  TC120  booking 2: the first free time after 3 PM (1 hr) -> Booking Details: NO "Membership credit", "Member
+ *  TC45  booking 2: the first free time after 3 PM (1 hr) -> Booking Details: NO "Membership credit", "Member
  *         discount (10% off)" = 10% of the session price, "You pay" at most price − discount (wallet / card pay it)
  *         -> Confirm -> Booking Confirmed -> YopMail -> saved: no membership credit, paid = discounted price -> calendar
- *  TC121  cancel booking 2 -> the cancel popup's refund (policy tier of what was paid) -> applied -> slots free
+ *  TC46  cancel booking 2 -> the cancel popup's refund (policy tier of what was paid) -> applied -> slots free
  *
  * Times are never fixed: the first day (from today, up to 7 days ahead) with a free bay in the window is used.
  * The Join Core payment uses the card saved on the account (TEETIME_PAYMENT_MODE does not apply to it).
  */
 
-const round2 = (n: number) => Math.round(n * 100) / 100;
 /** Booking 1 lies in 1 PM – 3 PM (Core's credit hours end at 3 PM). */
 const CREDIT_WINDOW = { from: 13 * 60, to: 15 * 60 };
 /** Booking 2 starts at 3 PM or later (outside credit hours: only the member discount), ending by midnight. */
@@ -63,35 +62,9 @@ const DAILY_CREDIT_SLOTS = 8;
 const formatHours = (slots: number) => `${slots / 4} hr`;
 
 const money = (s: string) => Number(s.replace(/,/g, ""));
-/** "Session price after discounts" (or "Session price"), before credit and member discount. */
-function sessionPrice(text: string): number {
-  const m = text.match(/Session price after discounts\s*\$(\d+(?:,\d{3})*\.\d{2})/) ?? text.match(/Session price\s*\$(\d+(?:,\d{3})*\.\d{2})/);
-  if (!m) throw new Error(`No session price in Booking Details: ${text.slice(0, 300)}`);
-  return money(m[1]);
-}
-/** The "Membership credit – $x" line (0 when there is none). */
-const creditLine = (text: string) => money(text.match(/Membership credit\s*[–-]\s*\$(\d+(?:,\d{3})*\.\d{2})/)?.[1] ?? "0");
-/** The "Member discount (10% off) - $x" line: amount and percent (0 when there is none). */
-function discountLine(text: string): { amount: number; percent: number } {
-  const m = text.match(/Member discount(?:\s*\((\d+)% off\))?\s*[–-]\s*\$(\d+(?:,\d{3})*\.\d{2})/);
-  return { amount: money(m?.[2] ?? "0"), percent: Number(m?.[1] ?? 0) };
-}
 
-/**
- * The member credit a cancellation gives back, worked out like the app's cancel popup: the refund is `percent` of
- * everything paid (card + gift card + wallet + member credit); the rest (the fee) is taken from the card first, then
- * the gift card, the wallet, and last the member credit — what is left of the credit comes back.
- */
-function creditRefund(p: any, percent: number): number {
-  const card = Number(p?.cardAmount || 0);
-  const wallet = Number(p?.walletAmount || 0);
-  const gift = (p?.giftCards ?? []).reduce((sum: number, g: any) => sum + Number(g.amount || 0), 0);
-  const credit = Number(p?.membershipCreditAmount || 0);
-  const total = card + gift + wallet + credit;
-  let fee = round2(total - round2((total * percent) / 100));
-  for (const part of [card, gift, wallet]) fee = round2(fee - Math.min(fee, part));
-  return round2(credit - Math.min(fee, credit));
-}
+/** The member credit a cancellation of `booking` gives back (refundSplit: the fee is taken from the credit last). */
+const creditRefund = (booking: any, percent: number) => refundSplit(paidWith(booking), percent).credit;
 
 /** Runs `fn` with the booking length set to `minutes` (selectRequestedSlot reads env.bookingMinutes). */
 async function withBookingMinutes<T>(minutes: number, fn: () => Promise<T>): Promise<T> {
@@ -104,21 +77,15 @@ async function withBookingMinutes<T>(minutes: number, fn: () => Promise<T>): Pro
   }
 }
 
-/** Waiver -> card for what is left (if anything) -> Confirm -> Booking Confirmed -> the booking email. */
-async function confirmInModal(app: BookingApp, testInfo: TestInfo, modal: Locator, sel: SelectedBooking, groupSize = 1): Promise<CreatedBooking> {
-  await app.scrollThrough(modal);
-  await app.acceptWaiver(modal);
-  if ((await app.amountToPay(modal)) > 0) await orBlocked(testInfo, () => app.preparePayment(modal));
-  const bookingId = await app.confirmBooking(modal, { read: Math.min(1500, app.readMs) });
-  testInfo.annotations.push({ type: "bookingId", description: bookingId });
-  const booking = { ...sel, bookingId, groupSize };
-  await expectConfirmed(app, booking, { pause: false });
-  await showBookingEmail(app, testInfo, booking, "confirmed");
-  return booking;
+/**
+ * The Membership page's Refresh button (top right): it reloads the page, so the app reads GET /membership/me and the
+ * credit history anew instead of showing the answer it keeps for 30 s (staleTime).
+ */
+async function refreshMembership(app: BookingApp) {
+  await app.guidedClick(app.page.getByRole("button", { name: "Refresh", exact: true }), { read: app.readMs });
+  await expect(app.page, "the Membership page").toHaveURL(/\/membership$/);
+  await expect(app.page.getByRole("heading", { name: "Membership", level: 1 }), "the Membership page after Refresh").toBeVisible({ timeout: 30_000 });
 }
-
-/** How long the app keeps its GET /membership/me answer before the Membership page reads it again (staleTime). */
-const MEMBERSHIP_CACHE_MS = 30_000;
 
 /** The sidebar's "Book Your Bay" -> the calendar, inside the app (no page reload). Nothing to do when it is shown. */
 async function toCalendar(app: BookingApp) {
@@ -136,12 +103,12 @@ async function toMembership(app: BookingApp) {
   await expect(app.page.getByText("Monthly credit, member discount and more")).toBeVisible();
 }
 
-test.describe("Core membership: credit booking and discount booking @main @creates-booking", () => {
+test.describe("Core membership: credit booking and discount booking @membership @creates-booking", () => {
   let app: BookingApp;
   const suite = bookingSuite((a) => (app = a), { watch: true });
-  let member: any = null; // GET /membership/me once active (TC116)
-  let booking1: CreatedBooking | undefined; // paid with member credit (TC117)
-  let booking2: CreatedBooking | undefined; // member discount, no credit (TC120)
+  let member: any = null; // GET /membership/me once active (TC41)
+  let booking1: CreatedBooking | undefined; // paid with member credit (TC42)
+  let booking2: CreatedBooking | undefined; // member discount, no credit (TC45)
   let balanceBefore = 0; // credit balance before booking 1
   let creditUsed = 0; // member credit booking 1 used
   let cancelled1 = false;
@@ -154,7 +121,7 @@ test.describe("Core membership: credit booking and discount booking @main @creat
     }
   });
 
-  test("TC116: Membership -> Join Core -> Pay -> active Core member", async ({}, testInfo) => {
+  test("TC41: Membership -> Join Core -> Pay -> active Core member", async ({}, testInfo) => {
     requireBookingCreation();
     await app.openIfNeeded();
     const page = app.page;
@@ -162,7 +129,7 @@ test.describe("Core membership: credit booking and discount booking @main @creat
 
     member = await app.membership();
     if (isElite(member)) {
-      member = null; // TC117–121 are skipped too: they check a Core member
+      member = null; // TC42–46 are skipped too: they check a Core member
       test.skip(true, "Already an Elite member (an earlier run upgraded it): the Core cases need an account without membership, or on Core");
     }
     if (member?.status === "active") {
@@ -210,8 +177,8 @@ test.describe("Core membership: credit booking and discount booking @main @creat
     await app.readPause();
   });
 
-  test("TC117: booking 1 at 1–3 PM paid with member credit -> Booking Confirmed -> booking email -> back to the calendar", async ({}, testInfo) => {
-    test.skip(member?.status !== "active", "TC116: not an active member");
+  test("TC42: booking 1 at 1–3 PM paid with member credit -> Booking Confirmed -> booking email -> back to the calendar", async ({}, testInfo) => {
+    test.skip(member?.status !== "active", "TC41: not an active member");
     const m = await app.membership();
     balanceBefore = Number(m?.creditBalance ?? 0);
     test.skip(balanceBefore <= 0, `No member credit left this month ($${balanceBefore.toFixed(2)}): booking 1 cannot use credit`);
@@ -257,7 +224,7 @@ test.describe("Core membership: credit booking and discount booking @main @creat
     expect(toPay, `"You pay" at most $${price.toFixed(2)} − credit − discount = $${rest.toFixed(2)}`).toBeLessThanOrEqual(rest + 0.01);
     if (creditUsed >= price - 0.01) expect(discount.amount, "no member discount when the credit pays it all").toBe(0);
 
-    booking1 = await confirmInModal(app, testInfo, modal, sel); // … Booking Confirmed -> YopMail: the booking email
+    booking1 = await confirmNewBooking(app, testInfo, modal, sel); // … Booking Confirmed -> YopMail: the booking email
     const p = (await app.fetchBooking(booking1.bookingId))?.paymentBreakdown ?? {};
     testInfo.annotations.push({ type: "paymentBreakdown", description: JSON.stringify(p).slice(0, 300) });
     expect(Number(p.membershipCreditAmount || 0), "saved membership credit").toBeCloseTo(creditUsed, 2);
@@ -266,8 +233,8 @@ test.describe("Core membership: credit booking and discount booking @main @creat
     await app.viewMyBooking(booking1);
   });
 
-  test("TC118: Membership tab -> the credit booking 1 used: balance, used this month, credit history -> back to the calendar", async ({}, testInfo) => {
-    test.skip(!booking1, "TC117 did not create booking 1");
+  test("TC43: Membership tab -> the credit booking 1 used: balance, used this month, credit history -> back to the calendar", async ({}, testInfo) => {
+    test.skip(!booking1, "TC42 did not create booking 1");
     const page = app.page;
     const expected = round2(balanceBefore - creditUsed);
     // The API first (the page shows what it returns)
@@ -283,12 +250,10 @@ test.describe("Core membership: credit booking and discount booking @main @creat
     const shown = await balanceText.waitFor({ state: "visible", timeout: 5_000 }).then(() => true, () => false);
     if (!shown) {
       // The page shows the app's earlier answer: it keeps GET /membership/me for 30 s and read it less than 30 s ago
-      // (an older one would have been read again just now). After 30 s, calendar -> Membership again with the
-      // sidebar and the page reads it anew — no page reload
-      console.log("[teetime-e2e] membership: the page shows the app's earlier credit (kept 30 s); opening it again in 30 s");
-      await page.waitForTimeout(MEMBERSHIP_CACHE_MS + 1_000);
-      await toCalendar(app);
-      await toMembership(app);
+      // (an older one would have been read again just now). The page's own Refresh button reloads it, which reads
+      // it anew at once (instead of waiting out the 30 s)
+      console.log("[teetime-e2e] membership: the page shows the app's earlier credit (kept 30 s); pressing Refresh");
+      await refreshMembership(app);
     }
     await expect(balanceText, `the credit balance $${expected.toFixed(2)} on the Core card`).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText(`$${usedThisMonth.toFixed(2)} used this month`).first(), "used this month").toBeVisible();
@@ -318,19 +283,19 @@ test.describe("Core membership: credit booking and discount booking @main @creat
     await app.highlightBooking(booking1!);
   });
 
-  test("TC119: back on the calendar: cancel booking 1 -> Booking cancelled -> slots free -> the policy's share of the member credit comes back", async ({}, testInfo) => {
-    test.skip(!booking1, "TC117 did not create booking 1");
+  test("TC44: back on the calendar: cancel booking 1 -> Booking cancelled -> slots free -> the policy's share of the member credit comes back", async ({}, testInfo) => {
+    test.skip(!booking1, "TC42 did not create booking 1");
     const balanceBeforeCancel = Number((await app.membership())?.creditBalance ?? 0);
     // What comes back follows the refund policy for the time left before the start (90% / 50% / none)
     const minutes = minutesUntilStart(app, booking1!);
     const percent = refundPercentFor(minutes);
-    const back = creditRefund((await app.fetchBooking(booking1!.bookingId))?.paymentBreakdown, percent);
+    const back = creditRefund(await app.fetchBooking(booking1!.bookingId), percent);
     testInfo.annotations.push({
       type: "credit-refund",
       description: `${minutes} min before the start: ${percent}% -> $${back.toFixed(2)} of the $${creditUsed.toFixed(2)} credit back`,
     });
 
-    // The calendar must show booking 1's day (its ⋮ is opened there); TC118 left it there — make sure when run alone
+    // The calendar must show booking 1's day (its ⋮ is opened there); TC43 left it there — make sure when run alone
     await app.goToDate(booking1!.date);
     await cancelInUi(app, testInfo, booking1!); // ⋮ -> Cancel booking -> Confirm Cancellation -> "Booking cancelled"
     cancelled1 = true;
@@ -345,11 +310,11 @@ test.describe("Core membership: credit booking and discount booking @main @creat
     testInfo.annotations.push({ type: "credit", description: `$${balanceBeforeCancel.toFixed(2)} + $${back.toFixed(2)} given back (${percent}%)` });
   });
 
-  test("TC120: booking 2 after 3 PM (outside credit hours): 10% member discount, no credit -> Booking Confirmed", async ({}, testInfo) => {
-    test.skip(member?.status !== "active", "TC116: not an active member");
+  test("TC45: booking 2 after 3 PM (outside credit hours): 10% member discount, no credit -> Booking Confirmed", async ({}, testInfo) => {
+    test.skip(member?.status !== "active", "TC41: not an active member");
     const plan = member.plan;
     // The first free time after 3 PM: credit hours are over, only the member discount applies
-    // The calendar as it is (TC119 left it open; no reload)
+    // The calendar as it is (TC44 left it open; no reload)
     await toCalendar(app);
     const sel = await withBookingMinutes(BOOKING_MINUTES, () =>
       selectRequestedSlot(app, testInfo, [], { rescheduleRoom: false, dayWindow: DISCOUNT_WINDOW, reuseOpenPage: true }),
@@ -373,20 +338,18 @@ test.describe("Core membership: credit booking and discount booking @main @creat
     // The wallet (if it has credit) pays before the card: "You pay" is what is left of the discounted price
     expect(toPay, `"You pay" at most the discounted price $${afterDiscount.toFixed(2)}`).toBeLessThanOrEqual(afterDiscount + 0.01);
 
-    booking2 = await confirmInModal(app, testInfo, modal, sel); // … Booking Confirmed -> YopMail: the booking email
-    suite.track(booking2);
+    booking2 = await confirmNewBooking(app, testInfo, modal, sel, { track: suite.track }); // … Booking Confirmed -> YopMail: the booking email
 
     // Saved: no membership credit; wallet + card paid the discounted price
     const p = (await app.fetchBooking(booking2.bookingId))?.paymentBreakdown ?? {};
     testInfo.annotations.push({ type: "paymentBreakdown", description: JSON.stringify(p).slice(0, 300) });
     expect(Number(p.membershipCreditAmount || 0), "no membership credit saved").toBe(0);
-    const gifts = (p.giftCards ?? []).reduce((sum: number, g: any) => sum + Number(g.amount || 0), 0);
-    expect(round2(Number(p.cardAmount || 0) + Number(p.walletAmount || 0) + gifts), "paid = the discounted price").toBeCloseTo(afterDiscount, 1);
+    expect(round2(Number(p.cardAmount || 0) + Number(p.walletAmount || 0) + giftTotal(p)), "paid = the discounted price").toBeCloseTo(afterDiscount, 1);
     await app.viewMyBooking(booking2); // back to the calendar
   });
 
-  test("TC121: cancel booking 2 -> refund shown and applied -> slots free", async ({}, testInfo) => {
-    test.skip(!booking2, "TC120 did not create booking 2");
+  test("TC46: cancel booking 2 -> refund shown and applied -> slots free", async ({}, testInfo) => {
+    test.skip(!booking2, "TC45 did not create booking 2");
     await app.goToDate(booking2!.date); // the calendar on booking 2's day (its ⋮ is opened there)
     await cancelInUi(app, testInfo, booking2!, { checkRefund: true }); // the policy tier of what was paid (wallet / card)
     suite.markCancelled();
@@ -397,24 +360,24 @@ test.describe("Core membership: credit booking and discount booking @main @creat
 // ───────────────────────────── Elite upgrade ─────────────────────────────
 
 /**
- * Test cases 122–127 — upgrade to Elite, a booking paid with Elite credit (cancelled), then one with the 15% Elite
- * discount and no credit (cancelled from My Booking). A group of its own after TC116–121: it runs even when one of those
+ * Test cases 47–52 — upgrade to Elite, a booking paid with Elite credit (cancelled), then one with the 15% Elite
+ * discount and no credit (cancelled from My Booking). A group of its own after TC41–46: it runs even when one of those
  * failed, and needs only an active Core (or already Elite) member.
  *
  * The upgrade cannot be undone by the test: the app switches back to Core only at the next renewal. On an account that
- * is already Elite, TC122 is skipped (there is no "Upgrade to Elite" any more) and TC123 checks the Elite membership.
+ * is already Elite, TC47 is skipped (there is no "Upgrade to Elite" any more) and TC48 checks the Elite membership.
  *
- *  TC122  Membership -> "Upgrade to Elite" -> the popup: title, $299/month, +$400 credit and the seven Elite benefits
- *  TC123  "Upgrade now" -> POST /membership/change-plan (charged to the card on file; no card form) -> "You're now on
+ *  TC47  Membership -> "Upgrade to Elite" -> the popup: title, $299/month, +$400 credit and the seven Elite benefits
+ *  TC48  "Upgrade now" -> POST /membership/change-plan (charged to the card on file; no card form) -> "You're now on
  *         Elite" -> GET /membership/me: active Elite, $550 / 15%, credit up by $400 -> the page and the sidebar say Elite
- *  TC124  booking 1: the first free hour inside the plan's credit hours (1 AM – 3 PM), on a day with credit hours left
+ *  TC49  booking 1: the first free hour inside the plan's credit hours (1 AM – 3 PM), on a day with credit hours left
  *         -> 1, 2 and 3 players cost the same -> 5 players (the whole bay): the credit pays everything, also the app's
  *         $5/hr for 4–5 players while the plan's freePersons is below 5 -> "You pay" $0.00 -> Booking Confirmed
  *         -> saved: the credit, 5 players, nothing from card / wallet / gift card; balance down by the credit used
- *  TC125  cancel booking 1 on the calendar -> refund policy's share of the credit is back in the balance
- *  TC126  booking 2: the first free hour after credit hours, 2 players -> no credit, "Member discount (15% off)" = 15% of
+ *  TC50  cancel booking 1 on the calendar -> refund policy's share of the credit is back in the balance
+ *  TC51  booking 2: the first free hour after credit hours, 2 players -> no credit, "Member discount (15% off)" = 15% of
  *         the session price, "You pay" = price − discount − wallet -> Booking Confirmed -> saved amounts; credit unchanged
- *  TC127  My Booking -> booking 2's card -> Modify -> Cancel booking -> refund shown and applied -> saved as cancelled, card
+ *  TC52  My Booking -> booking 2's card -> Modify -> Cancel booking -> refund shown and applied -> saved as cancelled, card
  *         gone, slots free; credit unchanged
  */
 const ELITE_FEATURES = [
@@ -426,7 +389,7 @@ const ELITE_FEATURES = [
   "Book 15 days ahead",
   "Up to 3 players at no extra cost",
 ];
-/** Players in the Elite credit booking (TC124): the whole bay. */
+/** Players in the Elite credit booking (TC49): the whole bay. */
 const ELITE_PLAYERS = 5;
 /** The app's charge for a group bigger than the plan's free players ("+$5.00/hr" for 4–5 players). */
 const EXTRA_PERSONS_PER_HOUR = 5;
@@ -436,13 +399,13 @@ const clock = (hhmm: string) => Number(hhmm.split(":")[0]) * 60 + Number(hhmm.sp
 const creditHours = (plan: any) => ({ from: clock(plan.creditWindows[0].startTime), to: clock(plan.creditWindows[0].endTime) });
 const creditBalance = async (app: BookingApp) => round2(Number((await app.membership())?.creditBalance ?? NaN));
 
-test.describe("Elite membership: upgrade, credit booking and discount booking @main @creates-booking", () => {
+test.describe("Elite membership: upgrade, credit booking and discount booking @membership @creates-booking", () => {
   let app: BookingApp;
   const suite = bookingSuite((a) => (app = a), { watch: true });
-  let elite: any = null; // GET /membership/me once Elite (TC123)
-  let upgradeOpen = false; // TC122 left the Upgrade to Elite popup open
-  let booking1: CreatedBooking | undefined; // paid with Elite credit (TC124)
-  let booking2: CreatedBooking | undefined; // 15% discount, no credit (TC126)
+  let elite: any = null; // GET /membership/me once Elite (TC48)
+  let upgradeOpen = false; // TC47 left the Upgrade to Elite popup open
+  let booking1: CreatedBooking | undefined; // paid with Elite credit (TC49)
+  let booking2: CreatedBooking | undefined; // 15% discount, no credit (TC51)
   let creditUsed = 0;
   let cancelled1 = false;
 
@@ -454,11 +417,11 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @m
     }
   });
 
-  test("TC122: Membership -> Upgrade to Elite -> the popup shows the price, the credit and every Elite benefit", async ({}, testInfo) => {
+  test("TC47: Membership -> Upgrade to Elite -> the popup shows the price, the credit and every Elite benefit", async ({}, testInfo) => {
     requireBookingCreation();
     await app.openIfNeeded();
     const m = await app.membership();
-    test.skip(m?.status !== "active", "Not an active member: there is no plan to upgrade (TC116 joins Core)");
+    test.skip(m?.status !== "active", "Not an active member: there is no plan to upgrade (TC41 joins Core)");
     test.skip(isElite(m), "Already an Elite member: the app no longer offers \"Upgrade to Elite\"");
     await toMembership(app);
     await app.guidedClick(app.page.getByRole("button", { name: "Upgrade to Elite", exact: true }), { read: app.readMs });
@@ -475,7 +438,7 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @m
     await app.readPause();
   });
 
-  test("TC123: Upgrade now -> You're now on Elite -> active Elite member", async ({}, testInfo) => {
+  test("TC48: Upgrade now -> You're now on Elite -> active Elite member", async ({}, testInfo) => {
     requireBookingCreation();
     const page = app.page;
     const before = await app.membership();
@@ -487,7 +450,7 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @m
       await toMembership(app);
       elite = before;
     } else {
-      test.skip(!upgradeOpen, "TC122 did not open the Upgrade to Elite popup");
+      test.skip(!upgradeOpen, "TC47 did not open the Upgrade to Elite popup");
       const popup = app.dialog(/Upgrade to Elite/);
       const changed = page.waitForResponse((r) => r.request().method() === "POST" && /\/membership\/change-plan(\?|$)/.test(r.url()), { timeout: 60_000 });
       await app.guidedClick(popup.getByRole("button", { name: "Upgrade now", exact: true }), { read: app.readMs });
@@ -523,8 +486,8 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @m
     await app.readPause();
   });
 
-  test("TC124: booking 1 with Elite credit: 5 players, nothing to pay -> Booking Confirmed -> credit deducted", async ({}, testInfo) => {
-    test.skip(!elite, "TC123: not an Elite member");
+  test("TC49: booking 1 with Elite credit: 5 players, nothing to pay -> Booking Confirmed -> credit deducted", async ({}, testInfo) => {
+    test.skip(!elite, "TC48: not an Elite member");
     const m = await app.membership();
     const before = round2(Number(m.creditBalance));
     test.skip(before <= 0, "No Elite credit left this month");
@@ -566,7 +529,7 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @m
       description: `${isoDate(sel.date)} ${sel.startTime}–${sel.endTime} ${sel.bayName}: $${prices[0].toFixed(2)} for ${ELITE_PLAYERS} players (extra players $${extraFor(ELITE_PLAYERS).toFixed(2)}, paid by the credit), credit −$${creditUsed.toFixed(2)}, you pay $0.00 (credit balance $${before.toFixed(2)})`,
     });
 
-    booking1 = await confirmInModal(app, testInfo, modal, sel, ELITE_PLAYERS);
+    booking1 = await confirmNewBooking(app, testInfo, modal, sel, { groupSize: ELITE_PLAYERS });
     const saved = await app.fetchBooking(booking1.bookingId);
     const p = saved?.paymentBreakdown ?? {};
     testInfo.annotations.push({ type: "saved", description: JSON.stringify({ paymentBreakdown: p, pricing: saved?.metadata?.pricing, membership: saved?.metadata?.membership }).slice(0, 600) });
@@ -583,11 +546,11 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @m
     await app.viewMyBooking(booking1);
   });
 
-  test("TC125: cancel booking 1 -> Booking cancelled -> slots free -> the policy's share of the Elite credit comes back", async ({}, testInfo) => {
-    test.skip(!booking1, "TC124 did not create booking 1");
+  test("TC50: cancel booking 1 -> Booking cancelled -> slots free -> the policy's share of the Elite credit comes back", async ({}, testInfo) => {
+    test.skip(!booking1, "TC49 did not create booking 1");
     const before = await creditBalance(app);
     const percent = refundPercentFor(minutesUntilStart(app, booking1!));
-    const back = creditRefund((await app.fetchBooking(booking1!.bookingId))?.paymentBreakdown, percent);
+    const back = creditRefund(await app.fetchBooking(booking1!.bookingId), percent);
     await app.goToDate(booking1!.date);
     await cancelInUi(app, testInfo, booking1!);
     cancelled1 = true;
@@ -599,8 +562,8 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @m
     testInfo.annotations.push({ type: "credit", description: `$${before.toFixed(2)} + $${back.toFixed(2)} given back (${percent}%)` });
   });
 
-  test("TC126: booking 2 after credit hours: 15% Elite discount, no credit -> payment -> Booking Confirmed", async ({}, testInfo) => {
-    test.skip(!elite, "TC123: not an Elite member");
+  test("TC51: booking 2 after credit hours: 15% Elite discount, no credit -> payment -> Booking Confirmed", async ({}, testInfo) => {
+    test.skip(!elite, "TC48: not an Elite member");
     const before = await creditBalance(app);
     const wallet = await app.walletBalance();
     const percent = Number(elite.plan.discountPercent);
@@ -629,8 +592,7 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @m
     expect(Math.abs(toPay - (final - fromWallet)), `"You pay" $${toPay} = $${final} − wallet $${fromWallet}`).toBeLessThanOrEqual(0.02);
     if (toPay === 0) testInfo.annotations.push({ type: "warning", description: "the wallet covers the whole booking: the card payment is NOT tested in this run" });
 
-    booking2 = await confirmInModal(app, testInfo, modal, sel, 2);
-    suite.track(booking2);
+    booking2 = await confirmNewBooking(app, testInfo, modal, sel, { groupSize: 2, track: suite.track });
     const saved = await app.fetchBooking(booking2.bookingId);
     const p = saved?.paymentBreakdown ?? {};
     testInfo.annotations.push({ type: "saved", description: JSON.stringify({ paymentBreakdown: p, pricing: saved?.metadata?.pricing, membership: saved?.metadata?.membership }).slice(0, 600) });
@@ -645,8 +607,8 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @m
     await app.viewMyBooking(booking2);
   });
 
-  test("TC127: My Booking -> cancel booking 2 -> refund shown and applied -> cancelled, slots free, credit unchanged", async ({}, testInfo) => {
-    test.skip(!booking2, "TC126 did not create booking 2");
+  test("TC52: My Booking -> cancel booking 2 -> refund shown and applied -> cancelled, slots free, credit unchanged", async ({}, testInfo) => {
+    test.skip(!booking2, "TC51 did not create booking 2");
     const b = booking2!;
     const page = app.page;
     const before = await creditBalance(app);
@@ -695,32 +657,32 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @m
 // ───────────────────────────── cancel and keep the membership ─────────────────────────────
 
 /**
- * Test cases 128–132 — cancel the Elite membership, book while it is cancelled, cancel that booking, keep the membership.
+ * Test cases 53–57 — cancel the Elite membership, book while it is cancelled, cancel that booking, keep the membership.
  * Cancelling a membership only stops the renewal: it stays active, with its benefits and credit, until the end of the paid
- * period ("You keep your benefits and credit until then"). So the booking still gets the Elite price (TC130).
+ * period ("You keep your benefits and credit until then"). So the booking still gets the Elite price (TC55).
  *
- *  TC128  Membership (active Elite) -> "Cancel membership" -> the popup: "Cancel your membership?", benefits until the
+ *  TC53  Membership (active Elite) -> "Cancel membership" -> the popup: "Cancel your membership?", benefits until the
  *         period end, the reasons -> a reason is picked -> "Continue" when the app shows one (today it does not: the reasons
  *         and the confirmation are one popup)
- *  TC129  "Cancel membership" in the popup -> POST /membership/cancel with the reason -> "Your membership won't renew" ->
+ *  TC54  "Cancel membership" in the popup -> POST /membership/cancel with the reason -> "Your membership won't renew" ->
  *         GET /membership/me: cancelAtPeriodEnd, the reason, still active, same credit -> the page: "Ends …", "Keep my membership"
- *  TC130  a booking on a day before the period end, after credit hours: the Elite discount as until the end of the period,
+ *  TC55  a booking on a day before the period end, after credit hours: the Elite discount as until the end of the period,
  *         no credit; "You pay" = price − discount − wallet -> Booking Confirmed -> saved amounts; credit unchanged
- *  TC131  My Booking -> that booking -> Modify -> Cancel booking -> refund policy shown and applied -> cancelled, slots free
- *  TC132  "Keep my membership" -> POST /membership/resume -> "Your membership will keep renewing" -> renewing again, as before
+ *  TC56  My Booking -> that booking -> Modify -> Cancel booking -> refund policy shown and applied -> cancelled, slots free
+ *  TC57  "Keep my membership" -> POST /membership/resume -> "Your membership will keep renewing" -> renewing again, as before
  *
- * A run that stops between TC129 and TC132 presses "Keep my membership" at the end, so the account is not left cancelled.
+ * A run that stops between TC54 and TC57 presses "Keep my membership" at the end, so the account is not left cancelled.
  */
 const CANCEL_REASONS = ["Too expensive", "Not using it enough", "Moving away", "Switching to another place", "Just taking a break", "Other"];
 const CANCEL_REASON = "Just taking a break";
 
-test.describe("Cancel and keep membership @main @creates-booking", () => {
+test.describe("Cancel and keep membership @membership @creates-booking", () => {
   let app: BookingApp;
   const suite = bookingSuite((a) => (app = a), { watch: true });
   let start: any = null; // GET /membership/me before cancelling
-  let popupReady = false; // TC128 left the popup open with a reason picked
-  let cancelled = false; // the membership is cancelled (TC129) and not kept yet (TC132)
-  let booking: CreatedBooking | undefined; // TC130
+  let popupReady = false; // TC53 left the popup open with a reason picked
+  let cancelled = false; // the membership is cancelled (TC54) and not kept yet (TC57)
+  let booking: CreatedBooking | undefined; // TC55
 
   const popup = () => app.dialog(/Cancel your membership\?/);
   /** The period end as the page writes it, in the browser's time zone: "Dec 21, 2026" (or "Dec 21"). */
@@ -744,12 +706,12 @@ test.describe("Cancel and keep membership @main @creates-booking", () => {
     }
   });
 
-  test("TC128: Membership -> Cancel membership -> the popup: benefits until the period end, the reasons, a reason picked", async ({}, testInfo) => {
+  test("TC53: Membership -> Cancel membership -> the popup: benefits until the period end, the reasons, a reason picked", async ({}, testInfo) => {
     requireBookingCreation();
     await app.openIfNeeded();
     start = await app.membership();
-    test.skip(!isElite(start), "Not an active Elite member (TC123 upgrades to Elite)");
-    // Cancelled with this test's own reason: an earlier run stopped before TC132 -> keep it first, then start as usual.
+    test.skip(!isElite(start), "Not an active Elite member (TC48 upgrades to Elite)");
+    // Cancelled with this test's own reason: an earlier run stopped before TC57 -> keep it first, then start as usual.
     // Cancelled with any other reason: somebody else did that, so it is left alone
     const leftOver = start.cancelAtPeriodEnd === true && start.cancelReason === CANCEL_REASON;
     test.skip(
@@ -789,8 +751,8 @@ test.describe("Cancel and keep membership @main @creates-booking", () => {
     await app.readPause();
   });
 
-  test("TC129: confirm Cancel membership -> won't renew -> ends at the period end, still active until then", async ({}, testInfo) => {
-    test.skip(!popupReady, "TC128 did not open the Cancel membership popup");
+  test("TC54: confirm Cancel membership -> won't renew -> ends at the period end, still active until then", async ({}, testInfo) => {
+    test.skip(!popupReady, "TC53 did not open the Cancel membership popup");
     const page = app.page;
     const response = page.waitForResponse((r) => r.request().method() === "POST" && /\/membership\/cancel(\?|$)/.test(r.url()), { timeout: 60_000 });
     await app.guidedClick(page.getByRole("dialog").getByRole("button", { name: "Cancel membership", exact: true }), { read: app.readMs });
@@ -821,8 +783,8 @@ test.describe("Cancel and keep membership @main @creates-booking", () => {
     await app.readPause();
   });
 
-  test("TC130: a booking while the membership is cancelled: the Elite price until the period end, no credit -> Booking Confirmed", async ({}, testInfo) => {
-    test.skip(!cancelled, "TC129 did not cancel the membership");
+  test("TC55: a booking while the membership is cancelled: the Elite price until the period end, no credit -> Booking Confirmed", async ({}, testInfo) => {
+    test.skip(!cancelled, "TC54 did not cancel the membership");
     const plan = start.plan;
     const before = await creditBalance(app);
     const wallet = await app.walletBalance();
@@ -856,8 +818,7 @@ test.describe("Cancel and keep membership @main @creates-booking", () => {
     expect(Math.abs(discount.amount - (price * Number(plan.discountPercent)) / 100), `discount $${discount.amount} = ${plan.discountPercent}% of $${price}`).toBeLessThanOrEqual(0.02);
     expect(Math.abs(toPay - (final - fromWallet)), `"You pay" $${toPay} = $${final} − wallet $${fromWallet}`).toBeLessThanOrEqual(0.02);
 
-    booking = await confirmInModal(app, testInfo, modal, sel);
-    suite.track(booking);
+    booking = await confirmNewBooking(app, testInfo, modal, sel, { track: suite.track });
     const saved = await app.fetchBooking(booking.bookingId);
     const p = saved?.paymentBreakdown ?? {};
     const used = saved?.metadata?.membership;
@@ -872,14 +833,14 @@ test.describe("Cancel and keep membership @main @creates-booking", () => {
     await app.viewMyBooking(booking);
   });
 
-  test("TC131: My Booking -> cancel that booking -> refund shown and applied -> cancelled, slots free, credit unchanged", async ({}, testInfo) => {
-    test.skip(!booking, "TC130 did not create the booking");
+  test("TC56: My Booking -> cancel that booking -> refund shown and applied -> cancelled, slots free, credit unchanged", async ({}, testInfo) => {
+    test.skip(!booking, "TC55 did not create the booking");
     const b = booking!;
     const page = app.page;
     const before = await creditBalance(app);
     await app.guidedClick(page.getByText("My Booking", { exact: true }).first(), { read: app.readMs });
     await expect(page, "the My Booking page").toHaveURL(/\/my-bookings$/);
-    // Exactly one card must match (as in TC127), so that no other booking can be cancelled
+    // Exactly one card must match (as in TC52), so that no other booking can be cancelled
     let card = page
       .locator("div.rounded-2xl.border-green-200:visible")
       .filter({ has: page.getByRole("button", { name: "Modify", exact: true }) })
@@ -916,8 +877,8 @@ test.describe("Cancel and keep membership @main @creates-booking", () => {
     await expectBookingGone(app, b);
   });
 
-  test("TC132: Keep my membership -> keeps renewing -> active Elite as before", async ({}, testInfo) => {
-    test.skip(!cancelled, "TC129 did not cancel the membership");
+  test("TC57: Keep my membership -> keeps renewing -> active Elite as before", async ({}, testInfo) => {
+    test.skip(!cancelled, "TC54 did not cancel the membership");
     const page = app.page;
     await toMembership(app);
     await expect(page.getByText(`Ends ${await endDate()}`, { exact: true }), "cancelled until now").toBeVisible({ timeout: 15_000 });

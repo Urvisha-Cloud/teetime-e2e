@@ -56,73 +56,49 @@ fixed test OTP for the test account, set `TEETIME_TEST_OTP` and it logs in by it
 
 | What | Command |
 |---|---|
-| Everything (creating tests need `TEETIME_ALLOW_BOOKING_CREATION=true`) | `npm test` |
-| Watch it run in a visible browser | `npm run test:headed` |
-| Booking journey only (signup -> book -> confirmation -> calendar), visible | `npm run test:create` |
-| All negative cases (TC15–25), visible | `npm run test:negative` |
-| Payment errors only (TC18–25), visible | `npm run test:payment` |
-| No group size case (TC25), visible | `npm run test:no-group-size` |
-| Any one test by name, visible | `npm run test:one -- "TC21"` |
+| The main run: every step in `tests/main`, in the order `tests/main.spec.ts` imports them (creating tests need `TEETIME_ALLOW_BOOKING_CREATION=true`) | `npm test` |
+| The main run without the watching pauses, cursor and YopMail window | `npm run test:fast` |
+| One step of the main run (e.g. the wallet cases) | `npm run test:wallet` (all in [COMMANDS.md](COMMANDS.md)) |
+| Any one test by its number, visible | `npm run test:one -- "TC21:"` |
 | Visual runner | `npm run test:ui` |
-| Read-only tests only (never creates a booking) | `npm run test:readonly` |
-| Only the test that creates a booking (TC11–14, one booking) | `npm run test:booking` |
-| Group sizes 1–5 (no booking) | `npm run test:group-sizes` |
-| One group size | `npx playwright test -g "group size 3" --headed` |
-| One case | `npx playwright test -g "TC11" --headed` |
+| One case | `npx playwright test -g "TC2:" --headed` |
 | Step-by-step debug | `npx playwright test -g "TC1:" --debug` |
 | Visual runner (pick tests, watch live) | `npx playwright test --ui` |
 | HTML report (screenshots, video, traces on failure) | `npm run report` |
 
 ## Notes
 
-* **Bookings and charges:** a full `npm test` creates exactly **one** booking (TC11, group size 3), charged to the
-  saved card in Stripe test mode. Every other test is read-only or answers the create call with a simulated
-  response. With `TEETIME_CLEANUP=true` the booking is cancelled after TC14 (dev applies its normal 10% cancellation fee to the test refund). Confirmation and
-  cancellation emails go to the test account.
+* **Bookings and charges:** `npm test` creates real bookings on dev (Stripe test mode: the saved test card or a
+  Stripe published test card), wallet and gift card payments and a Core / Elite membership; the cancel steps cancel
+  most of them again through the app. [COMMANDS.md](COMMANDS.md) lists, per command, which bookings stay.
+  Confirmation and cancellation emails go to the test account.
 * **Login expiry:** if a run says "Not authenticated" or the setup step asks for a code, run `npm run auth` again.
-* **Full slot:** if 8–9 PM is booked in every bay, that test is skipped with a `blocked` annotation instead of failing.
-* **Known app issue (TC17):** double-clicking Confirm sends two create requests. On the real API the database rejects
-  the second ("Exclusion constraint error") and the error toast appears on the confirmation screen. TC17 now answers
-  both requests itself (nothing is booked) and is marked as an expected failure (`test.fail`), so the run keeps one
-  window and reports it as a known bug. When the booking site disables Confirm after the first click, TC17 is
-  reported as "unexpectedly passed": then remove the `test.fail(...)` line.
+* **Free time:** the tests find the first free time themselves (today first, then up to 7 days ahead); a step with
+  nothing free is skipped with a `blocked` annotation instead of failing.
 * **Waiver:** the tests only tick the waiver checkbox; the waiver page is never opened.
-* **Scheduled runs:** on Windows use Task Scheduler (run `npm test` with "Start in" set to this folder); on Mac/Linux
-  a cron job such as `0 9 * * * cd /path/to/teetime-e2e && npm test`. The saved login eventually expires, so a
-  scheduled run will need `npm run auth` again from time to time.
 
 ## Safety
 
 * Creating tests skip unless `TEETIME_ALLOW_BOOKING_CREATION=true` **and** both web and API hosts look like dev/staging/local.
-* Read-only tests (TC1–7, TC10, TC15) route-abort any `POST /booking/:locationId/:bayId` and assert none was sent.
-* TC16 answers the create call with a simulated failure — nothing reaches staging.
 * Payment: staging Stripe is in test mode (`pk_test_`). Use the test account's saved card (`TEETIME_PAYMENT_MODE=saved-card`) or a Stripe published test card (`test-card`).
 * `retries: 0`, `workers: 1` — a retry after a slow successful POST would book twice.
 * `TEETIME_CLEANUP=true` cancels created bookings through the app's own endpoint `PATCH /booking/cancel/:id?wantRefund=true`.
-* If 8:00–9:00 PM is taken in every bay (or the date isn't allowed), the test is **skipped with a `blocked` annotation**. It never switches to another time.
 
 ## Test cases
 
-| # | File | Creates booking |
-|---|---|---|
-| TC1–5 group size 1..5 can be selected, waiver ticked, Confirm enabled (not pressed) | `group-sizes.spec.ts` | no |
-| TC6 header: location / date / selected time | `booking-ui.spec.ts` | no |
-| TC7 Book Now opens the correct modal | `booking-ui.spec.ts` | no |
-| TC10 Group-size + waiver validation | `booking-ui.spec.ts` | no |
-| TC11–14 Confirm → confirmation screen → View My Booking → visible on calendar | `booking-create.spec.ts` | yes (1 shared) |
-| TC15 Unavailable (past / booked) slots can't be selected | `booking-negative.spec.ts` | no |
-| TC16 Error handling when booking creation fails (500 / success:false) | `booking-negative.spec.ts` | no (mocked) |
-| TC17 Double-click Confirm sends one create request (simulated success, nothing reaches staging) | `booking-negative.spec.ts` | no (mocked) |
-| TC18 Invalid card number rejected before any booking request | `payment-negative.spec.ts` | no |
-| TC19 Missing ZIP code rejected before any booking request | `payment-negative.spec.ts` | no |
-| TC25 No group size selected (waiver + valid card filled): blocked with the group-size error before any booking request | `payment-negative.spec.ts` | no |
-| TC27–31 Reschedule: book → ⋮ → Manage your booking → Reschedule → Start Rescheduling → new time → Reschedule → Confirm Changes → Reschedule details (waiver) → Confirm → Booking Confirmed → View My Booking → calendar shows the new time | `booking-reschedule.spec.ts` | yes (1) |
-| TC32–34 Update group size (same booking): ⋮ → Manage your booking → Update Group Size → Select Group Size → Add players → Reschedule details (waiver) → Confirm → Booking Confirmed → View My Booking → calendar shows the new group size | `booking-reschedule.spec.ts` | (TC27's booking) |
-| TC48–53 Quick shift: ⋮ → 15 min earlier / 15 min later → Reschedule booking (Current / New) → Confirm changes → Booking Confirmed (10 s) → View My Booking → calendar | `booking-reschedule.spec.ts` | yes (2) |
-| TC35–37 Cancel: book → ⋮ → Manage your booking → Cancel Booking → Confirm Cancellation → "Booking cancelled" → calendar shows the slots free | `booking-cancel.spec.ts` | yes (1, cancelled in the test) |
-| TC38–41 Extend: book → ⋮ → Manage your booking → Extend Booking → +30 min → Continue → Extend details (waiver, pay) → Confirm → Booking Confirmed → View My Booking → calendar shows the new end time | `booking-extend.spec.ts` | yes (1) |
-| TC54–57 Extend popup controls: + / −, presets, maximum (past midnight), slider → +45 min → Extend details → Booking Confirmed → calendar → My Booking | `booking-extend.spec.ts` | yes (1) |
-| TC20–24 Stripe test cards declined on charge (insufficient funds, declined, expired, incorrect CVC, processing error): error toast, user stays in the modal, no booking left | `payment-negative.spec.ts` | no (sends a real create request; the backend deletes the pending booking) |
+The 57 cases of `npm test`, numbered TC1–TC57 in the order they run, with what each checks: the **Single tests**
+table in [COMMANDS.md](COMMANDS.md). They live in `tests/main`, one file per step, run in this order (the imports of `tests/main.spec.ts`):
+
+| File | Cases |
+|---|---|
+| `card-flow.ts` (`@card-flow`) | TC1–6 login → create → reschedule → group size → extend → cancel (card) |
+| `card-quick-shift.ts` (`@card-quick-shift`) | TC7–12 15 min earlier / later (card) |
+| `card-refund.ts` (`@card-refund`) | TC13–18 cancel with 50% refund / no refund (card) |
+| `card-switch-bay.ts` (`@card-switch-bay`) | TC19–24 extend to another bay, Switch to Trackman (card) |
+| `wallet.ts` (`@wallet-credit`) | TC25–32 wallet: create → reschedule → group size → extend → cancel |
+| `wallet-gift-card.ts` (`@wallet-gift-card`) | TC33 wallet + gift card, TC34 card + wallet + gift card (each booked and cancelled) |
+| `gift-card.ts` (`@gift-card`) | TC35–40 gift card: create → reschedule → extend → cancel |
+| `membership.ts` (`@membership`) | TC41–57 Core, Elite upgrade, cancel and keep membership |
 
 ## How the app behaves (from code analysis)
 

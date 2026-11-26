@@ -23,6 +23,13 @@ export interface BaySlotState {
   free: boolean;
 }
 
+/** The rendered calendar of one day, read once: every bay and, per slot index, whether that slot can be booked. */
+export interface CalendarGrid {
+  bays: { bayId: string; bayName: string }[];
+  /** free[bayId][slot]; a slot that is not rendered is missing (not free). */
+  free: Record<string, boolean[]>;
+}
+
 export interface SelectedBooking {
   locationName: string;
   bayId: string;
@@ -387,33 +394,48 @@ export class BookingApp {
 
   // ───────────────────────────── grid / availability ─────────────────────────────
 
-  /** Reads every bay column's state for a slot range straight from the rendered grid. */
-  async baysForRange(startIdx: number, endIdx: number): Promise<BaySlotState[]> {
-    await expect(this.page.locator(`[data-slot="${endIdx}"]`).first()).toBeAttached();
-    return this.page.evaluate(
-      ({ startIdx, endIdx }) => {
-        const firstRow = Array.from(document.querySelectorAll<HTMLElement>('[data-slot="0"]'));
-        const ids = firstRow.map((c) => c.getAttribute("data-screen")!);
-        const header = firstRow[0]?.closest(".min-w-max")?.firstElementChild;
-        const names = header
-          ? Array.from(header.querySelectorAll<HTMLElement>("span.whitespace-nowrap")).map((s) => s.innerText.trim())
-          : [];
-        return ids.map((bayId, i) => {
-          let free = true;
-          for (let s = startIdx; s <= endIdx; s++) {
-            const cell = document.querySelector<HTMLElement>(`[data-screen="${bayId}"][data-slot="${s}"]`);
-            const cls = cell?.className ?? "";
-            // CalenderGrid gives "hover:bg-gray-100 cursor-pointer" ONLY to slots that are free, in the future
-            // and on an active bay. Booked slots get "cursor-not-allowed"/booking styles, past slots "bg-black/5".
-            if (!cell || !cls.includes("hover:bg-gray-100") || cls.includes("cursor-not-allowed") || cls.includes("before:content")) {
-              free = false;
-            }
-          }
-          return { bayId, bayName: names[i] ?? `bay#${i + 1}`, free };
-        });
-      },
-      { startIdx, endIdx },
-    );
+  /**
+   * Reads the whole rendered calendar in one go: every bay column and every slot's state. A search over many start
+   * times (selectRequestedSlot) reads it once per day and checks each range in memory instead of in the page.
+   */
+  async readGrid(): Promise<CalendarGrid> {
+    await expect(this.page.locator('[data-slot="0"]').first()).toBeAttached();
+    return this.page.evaluate(() => {
+      const firstRow = Array.from(document.querySelectorAll<HTMLElement>('[data-slot="0"]'));
+      const ids = firstRow.map((c) => c.getAttribute("data-screen")!);
+      const header = firstRow[0]?.closest(".min-w-max")?.firstElementChild;
+      const names = header
+        ? Array.from(header.querySelectorAll<HTMLElement>("span.whitespace-nowrap")).map((s) => s.innerText.trim())
+        : [];
+      const free: Record<string, boolean[]> = Object.fromEntries(ids.map((id) => [id, [] as boolean[]]));
+      for (const cell of Array.from(document.querySelectorAll<HTMLElement>("[data-screen][data-slot]"))) {
+        const slots = free[cell.getAttribute("data-screen")!];
+        const s = Number(cell.getAttribute("data-slot"));
+        if (!slots || slots[s] !== undefined) continue; // the first cell of a slot counts (as document.querySelector)
+        const cls = cell.className ?? "";
+        // CalenderGrid gives "hover:bg-gray-100 cursor-pointer" ONLY to slots that are free, in the future
+        // and on an active bay. Booked slots get "cursor-not-allowed"/booking styles, past slots "bg-black/5".
+        slots[s] = cls.includes("hover:bg-gray-100") && !cls.includes("cursor-not-allowed") && !cls.includes("before:content");
+      }
+      return { bays: ids.map((bayId, i) => ({ bayId, bayName: names[i] ?? `bay#${i + 1}` })), free };
+    });
+  }
+
+  /**
+   * Every bay column's state for a slot range, straight from the rendered grid. `grid`: a calendar read earlier with
+   * readGrid() (no page round trip); without it the page is read now.
+   */
+  async baysForRange(startIdx: number, endIdx: number, grid?: CalendarGrid): Promise<BaySlotState[]> {
+    if (!grid) {
+      await expect(this.page.locator(`[data-slot="${endIdx}"]`).first()).toBeAttached();
+      grid = await this.readGrid();
+    }
+    const { free } = grid;
+    return grid.bays.map(({ bayId, bayName }) => {
+      let ok = true;
+      for (let s = startIdx; s <= endIdx && ok; s++) ok = free[bayId][s] === true;
+      return { bayId, bayName, free: ok };
+    });
   }
 
   /** Server-side cross-check using the bookings the calendar itself loaded. */
@@ -445,11 +467,13 @@ export class BookingApp {
     date: LocalDate,
     excludeBayIds: string[] = [],
     alsoFree?: { startIdx: number; endIdx: number },
+    /** The day's calendar read once with readGrid() (a search over many start times); without it the page is read. */
+    grid?: CalendarGrid,
   ): Promise<BaySlotState> {
     const { startIdx, endIdx } = slotRange(env.slotStart, env.slotEnd);
-    const bays = await this.baysForRange(startIdx, endIdx);
+    const bays = await this.baysForRange(startIdx, endIdx, grid);
     // alsoFree: the same bay must also be free for this range (e.g. the later reschedule + extend time)
-    const extra = alsoFree ? await this.baysForRange(alsoFree.startIdx, alsoFree.endIdx) : null;
+    const extra = alsoFree ? await this.baysForRange(alsoFree.startIdx, alsoFree.endIdx, grid) : null;
     const candidate = bays.find(
       (b) =>
         b.free &&

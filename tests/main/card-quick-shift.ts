@@ -1,94 +1,23 @@
-import type { BookingApp, CreatedBooking } from "../support/booking-app";
-import { env } from "../support/env";
-import { slotRange } from "../support/time";
+import type { BookingApp, CreatedBooking } from "../../support/booking-app";
 import {
-  addPlayers,
   bookFreeSlot,
   bookingSuite,
-  bookSlot,
-  chooseNewTime,
   clickAndExpectPatch,
-  confirmChangeDetails,
   expectConfirmed,
   manageBooking,
   requireBookingCreation,
   rescheduleConfirmation,
-  selectRequestedSlot,
   shiftedBy,
-  rescheduleSlotsRange,
+  showBookingEmail,
   slotsAfterRequested,
   slotsBeforeRequested,
-  startReschedule,
-  showBookingEmail,
-} from "./helper";
-import { expect, test } from "./fixtures";
+} from "../helper";
+import { expect, test } from "../fixtures";
 
 /**
- * Every reschedule case:
- *  TC27–34  reschedule to the 2 hours right after the booking (found at run time), then update the group size (one booking)
- *  TC48–53  quick shift from "Manage your booking": 15 min earlier / 15 min later (one booking each)
- * Each booking is cancelled afterwards (TEETIME_CLEANUP=true).
+ * Main run, step 1 (card): TC7–12 quick shift from "Manage your booking": 15 min earlier / 15 min later (one booking
+ * each, paid by card). Each booking is cancelled afterwards (TEETIME_CLEANUP=true).
  */
-
-test.describe("Reschedule a booking and update its group size @creates-booking", () => {
-  let app: BookingApp;
-  const suite = bookingSuite((a) => (app = a));
-  let original: CreatedBooking | undefined;
-  let rescheduled: CreatedBooking | undefined;
-  let resized: CreatedBooking | undefined;
-
-  // ───────────────────────────── reschedule ─────────────────────────────
-
-  test("TC27: book the original slot", async ({}, testInfo) => {
-    requireBookingCreation();
-    // The new time must also be free in the same bay, or the reschedule cannot be tested.
-    original = await bookFreeSlot(app, testInfo, { alsoFree: rescheduleSlotsRange() });
-    suite.track(original);
-    await app.viewMyBooking(original, { highlight: false });
-  });
-
-  test("TC28: ⋮ menu -> Manage your booking -> Reschedule -> Start rescheduling", async () => {
-    test.skip(!original, "TC27 did not create a booking");
-    await startReschedule(app, original!);
-  });
-
-  test("TC29: select the new time -> Reschedule -> confirmation -> Confirm Changes", async () => {
-    test.skip(!original, "TC27 did not create a booking");
-    const next = await chooseNewTime(app, original!, env.rescheduleStart, env.rescheduleEnd);
-    // In "Reschedule details" (TC30) the group size is changed too, to TEETIME_RESCHEDULE_GROUP_SIZE.
-    rescheduled = { ...next, groupSize: env.rescheduleGroupSize };
-  });
-
-  test(`TC30: Reschedule details -> group size ${env.rescheduleGroupSize} -> waiver -> Confirm -> Booking Confirmed with the new time and size`, async ({}, testInfo) => {
-    test.skip(!rescheduled, "TC29 did not start the reschedule");
-    await confirmChangeDetails(app, testInfo, "reschedule", rescheduled!, { pickGroupSize: true });
-  });
-
-  test("TC31: View My Booking -> calendar shows the booking at the new time", async () => {
-    test.skip(!rescheduled, "TC29 did not start the reschedule");
-    await app.viewMyBooking(rescheduled!);
-    // The old time no longer belongs to this booking (unless it overlaps the new range).
-    await app.expectNotOwnBooking(rescheduled!.bayId, original!.startIdx, original!.endIdx, rescheduled!);
-  });
-
-  // ───────────────────────────── update group size ─────────────────────────────
-
-  test("TC32: ⋮ menu -> Manage your booking -> Update Group Size -> select size -> Add players", async () => {
-    test.skip(!rescheduled, "TC29 did not start the reschedule");
-    resized = await addPlayers(app, rescheduled!, env.groupSizeUpdate);
-  });
-
-  test("TC33: Reschedule details with the new group size -> waiver -> Confirm -> Booking Confirmed", async ({}, testInfo) => {
-    test.skip(!resized, "TC32 did not start the group size update");
-    // Already selected by "Add players": only checked here, not clicked
-    await confirmChangeDetails(app, testInfo, "reschedule", resized!);
-  });
-
-  test("TC34: View My Booking -> calendar shows the booking with the new group size", async () => {
-    test.skip(!resized, "TC32 did not start the group size update");
-    await app.viewMyBooking(resized!); // also checks numberOfPersons from the API
-  });
-});
 
 // ───────────────────────────── quick shift: 15 min earlier / later ─────────────────────────────
 
@@ -96,10 +25,10 @@ test.describe("Reschedule a booking and update its group size @creates-booking",
 const QUICK_SHIFT_SETTLE_MS = 1000;
 
 for (const { minutes, label, first } of [
-  { minutes: -15, label: "15 min earlier", first: 48 },
-  { minutes: 15, label: "15 min later", first: 51 },
+  { minutes: -15, label: "15 min earlier", first: 7 },
+  { minutes: 15, label: "15 min later", first: 10 },
 ] as const) {
-  test.describe(`Quick shift: ${label} @main @creates-booking`, () => {
+  test.describe(`Quick shift: ${label} @card-quick-shift @creates-booking`, () => {
     let app: BookingApp;
     const suite = bookingSuite((a) => (app = a), { watch: true });
     let original: CreatedBooking | undefined;

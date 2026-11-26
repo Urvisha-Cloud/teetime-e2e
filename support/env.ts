@@ -6,6 +6,11 @@ dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
 const str = (name: string, fallback = ""): string =>
   (process.env[name] ?? fallback).trim();
 
+/** Fast run (npm run test:fast): every pause that is only there to watch the run is 0, whatever .env says. */
+const fast = str("TEETIME_FAST").toLowerCase() === "true";
+/** A pause for watching the run (ms); 0 in a fast run or when empty. */
+const watchMs = (name: string, fallback: string): number => (fast ? 0 : Number(str(name, fallback)) || 0);
+
 /** Hosts that count as non-production. Anything else is treated as production. */
 const NON_PROD_HOST = /^(localhost|127\.0\.0\.1|\[::1\])$|(^|[.-])(dev|develop|staging|stage|qa|test|uat)[.-]|\.localhost$|\.test$/i;
 
@@ -24,17 +29,11 @@ export const env = {
   rescheduleEnd: "",
   /** Quick pick pressed in the "Extend Booking" popup: "+30 min", "+1 hr", "+2 hr" or "+3 hr". */
   extendBy: str("TEETIME_EXTEND_BY", "+30 min"),
-  /** Group size chosen in "Reschedule details" during the reschedule (TC30). */
-  rescheduleGroupSize: Number(str("TEETIME_RESCHEDULE_GROUP_SIZE", "4")) || 4,
-  /** New group size for the group-size update test (players can only be added: must be > rescheduleGroupSize, max 5). */
+  /** New group size for the group-size update steps (players can only be added: more than the booking has, max 5). */
   groupSizeUpdate: Number(str("TEETIME_GROUP_SIZE_UPDATE", "5")) || 5,
   daysAhead: Number(str("TEETIME_DAYS_AHEAD", "0")),
   minLeadMinutes: Number(str("TEETIME_MIN_LEAD_MINUTES", "270")),
   browserTz: str("TEETIME_BROWSER_TZ", "Pacific/Honolulu"),
-  groupSizes: str("TEETIME_GROUP_SIZES", "1,2,3,4,5")
-    .split(",")
-    .map((s) => Number(s.trim()))
-    .filter((n) => Number.isInteger(n) && n >= 1 && n <= 5),
 
   testEmail: str("TEETIME_TEST_EMAIL"),
   giftCardCode: str("TEETIME_GIFT_CARD_CODE"),
@@ -59,15 +58,19 @@ export const env = {
     zip: str("TEETIME_STRIPE_TEST_ZIP"),
   },
   cleanup: str("TEETIME_CLEANUP") === "true",
+  /** TEETIME_FAST=true (npm run test:fast): the same checks without the watching extras below, so a run is minutes shorter. */
+  fast,
   /** How long the journey test keeps the confirmation screen and the booked calendar on screen (ms). */
-  showMs: Number(str("TEETIME_SHOW_MS", "3000")) || 0,
-  emailArriveMs: Number(str("TEETIME_EMAIL_ARRIVE_MS", "1000")),
+  showMs: watchMs("TEETIME_SHOW_MS", "3000"),
+  emailArriveMs: watchMs("TEETIME_EMAIL_ARRIVE_MS", "1000"),
   /** The same for a NEW booking's email, which takes longer to arrive. */
-  newBookingEmailArriveMs: Number(str("TEETIME_NEW_BOOKING_EMAIL_ARRIVE_MS", "8000")),
-  /** Watching a headed run: pause on each modal so it can be read (booking-flow.spec.ts). 0 = no pauses. */
-  readMs: Number(str("TEETIME_READ_MS", "1000")) || 0,
+  newBookingEmailArriveMs: watchMs("TEETIME_NEW_BOOKING_EMAIL_ARRIVE_MS", "8000"),
+  /** Watching a headed run: pause on each modal so it can be read. 0 = no pauses. */
+  readMs: watchMs("TEETIME_READ_MS", "1000"),
   /** Draw a visible mouse cursor (arrow + click pulse) in the test browser; Playwright's window shows none. */
-  showCursor: str("TEETIME_SHOW_CURSOR", "true").toLowerCase() !== "false",
+  showCursor: !fast && str("TEETIME_SHOW_CURSOR", "true").toLowerCase() !== "false",
+  /** Bring each booking email up in a YopMail window (headed runs; the test never reads it). Off: TEETIME_SHOW_EMAILS=false. */
+  showEmails: !fast && str("TEETIME_SHOW_EMAILS", "true").toLowerCase() !== "false",
 };
 
 export function isNonProductionHost(url: string): boolean {

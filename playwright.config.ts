@@ -20,9 +20,13 @@ if (process.argv.some((a) => a === "--project=setup" || a === "setup")) process.
 // One id per run (set in the main process; workers inherit it): a browser restarted after a failed test reuses the
 // login made earlier in the SAME run instead of showing the login popup again (tests/fixtures.ts).
 process.env.TEETIME_RUN_ID ??= String(Date.now());
-// `npm test` (= --grep @main; it runs booking-flow.spec.ts, whose TC42 is the login step) always logs in fresh. Feature commands
-// (npm run test:extend, test:cancel, …) reuse the login saved by an earlier run and open the calendar directly.
-if (process.argv.some((a) => a.includes("booking-flow.spec") || a.includes("@main"))) process.env.TEETIME_FRESH_LOGIN ??= "1";
+// `npm test` (= tests/main.spec.ts, all steps; TC1 of its card flow is the login step) and `npm run test:flow`
+// (--grep @card-flow) always log in fresh. The other step commands (npm run test:wallet, … = one step picked with
+// --grep) and test:one (-g) reuse the login saved by an earlier run and open the calendar directly.
+const picksSteps = process.argv.some((a) => a === "--grep" || a === "-g" || a.startsWith("--grep="));
+const isMainRun =
+  process.argv.some((a) => a.includes("@card-flow")) || (process.argv.some((a) => a.includes("main.spec")) && !picksSteps);
+if (isMainRun) process.env.TEETIME_FRESH_LOGIN ??= "1";
 const isAuthRun = process.env.TEETIME_AUTH_RUN === "1";
 
 // Which browser runs the tests: by this computer — Windows / Linux: Google Chrome, macOS: Safari (WebKit) — or
