@@ -18,7 +18,7 @@
     "test:wallet-gift-card": "playwright test tests/main.spec.ts --grep @wallet-gift-card --headed",
     "test:gift-card": "playwright test tests/main.spec.ts --grep @gift-card --headed",
     "test:membership": "playwright test tests/main.spec.ts --grep @membership --headed",
-    "test:one": "playwright test --headed -g",
+    "test:one": "node support/run-one.js --headed",
     "test:ui": "playwright test --ui",
     "report": "playwright show-report",
     "typecheck": "tsc --noEmit"

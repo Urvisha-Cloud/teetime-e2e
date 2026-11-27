@@ -66,15 +66,61 @@ const money = (s: string) => Number(s.replace(/,/g, ""));
 /** The member credit a cancellation of `booking` gives back (refundSplit: the fee is taken from the credit last). */
 const creditRefund = (booking: any, percent: number) => refundSplit(paidWith(booking), percent).credit;
 
-/** Runs `fn` with the booking length set to `minutes` (selectRequestedSlot reads env.bookingMinutes). */
-async function withBookingMinutes<T>(minutes: number, fn: () => Promise<T>): Promise<T> {
-  const before = env.bookingMinutes;
-  env.bookingMinutes = minutes;
-  try {
-    return await fn();
-  } finally {
-    env.bookingMinutes = before;
+/**
+ * Booking `b`'s card on the My Booking page. Every card has one "Modify" button, so a card is the largest block around
+ * one Modify button (found by that, not by its styling), matched by bay, start time and length — and by the date too
+ * when another of the user's bookings has the same. Exactly one card must be left, so that no other booking is changed.
+ */
+async function findMyBookingCard(app: BookingApp, b: CreatedBooking, what: string): Promise<Locator> {
+  let card = app.page
+    .getByRole("button", { name: "Modify", exact: true })
+    .locator("xpath=ancestor::div[count(.//button[normalize-space(.)='Modify'])=1][last()]")
+    .filter({ visible: true })
+    .filter({ hasText: new RegExp(`${b.bayName} – `) })
+    .filter({ hasText: pad12(b.startTime) })
+    .filter({ hasText: `${BOOKING_MINUTES} min` });
+  await expect(card.first(), `${what}'s card (${b.bayName}, ${pad12(b.startTime)})`).toBeVisible({ timeout: 20_000 });
+  if ((await card.count()) > 1) {
+    const month = headerLabel(b.date).split(" ")[0];
+    const days = compareDates(b.date, todayIn(app.tz)) / 86_400_000;
+    const near = days === 0 ? "|Today" : days === 1 ? "|Tomorrow" : "";
+    card = card.filter({ hasText: new RegExp(`${month}[a-z]* 0?${b.date.day}(?!\\d)|(?<!\\d)0?${b.date.day}(st|nd|rd|th)? ${month}${near}`) });
   }
+  await expect(card, `exactly one card for ${what}`).toHaveCount(1);
+  return card;
+}
+
+/**
+ * My Booking -> `b`'s card -> Modify -> Cancel booking -> the refund shown (policy tier of what was paid) -> Confirm
+ * Cancellation -> saved as cancelled with that refund, the card gone, the member credit unchanged, the cancel email,
+ * and its slots free on the calendar.
+ */
+async function cancelOnMyBookingPage(app: BookingApp, testInfo: TestInfo, b: CreatedBooking, what: string, markCancelled: () => void) {
+  const page = app.page;
+  const before = await creditBalance(app);
+  await app.guidedClick(page.getByText("My Booking", { exact: true }).first(), { read: app.readMs });
+  await expect(page, "the My Booking page").toHaveURL(/\/my-bookings$/);
+  const card = await findMyBookingCard(app, b, what);
+  await app.guidedClick(card.getByRole("button", { name: "Modify", exact: true }), { read: app.readMs });
+  const menu = app.dialog("Manage your booking");
+  await expect(menu).toBeVisible();
+  await app.guidedClick(menu.getByRole("button", { name: "Cancel booking", exact: true }), { read: app.readMs });
+  const cancel = app.dialog("Confirm Cancellation");
+  await expect(cancel.getByRole("heading", { name: "Cancel Booking" }), "the cancel popup").toBeVisible();
+
+  const refund = await expectRefundShown(app, testInfo, cancel, b); // policy tier of what was paid
+  await clickAndExpectPatch(app, testInfo, cancel.getByRole("button", { name: "Confirm Cancellation" }), "cancel", b.bookingId);
+  markCancelled();
+  await expect(cancel, "the cancel popup closes").toBeHidden({ timeout: 15_000 });
+  await expect(card, "the card is gone from My Booking").toHaveCount(0, { timeout: 20_000 });
+  const after = await app.fetchBooking(b.bookingId);
+  expect(after?.isCancelled, "saved as cancelled").toBe(true);
+  expect(Number(after?.metadata?.refundAmount ?? NaN), `refund applied: ${refund.percent}% of ${refund.paid.toFixed(2)}`).toBeCloseTo(refund.amount, 2);
+  expect(Number(after?.metadata?.cancellationFee ?? NaN), "cancellation fee = paid − refund").toBeCloseTo(round2(refund.paid - refund.amount), 2);
+  expect(await creditBalance(app), "credit neither deducted nor given back").toBeCloseTo(before, 2);
+  await showBookingEmail(app, testInfo, b, "cancelled");
+  await toCalendar(app);
+  await expectBookingGone(app, b);
 }
 
 /**
@@ -197,9 +243,7 @@ test.describe("Core membership: credit booking and discount booking @membership 
     // Membership -> calendar with the sidebar (no reload), then the first day with credit hours left and a bay free
     // inside 1–3 PM on the calendar as it is; another free slot is searched when one is taken
     await toCalendar(app);
-    const sel = await withBookingMinutes(BOOKING_MINUTES, () =>
-      selectRequestedSlot(app, testInfo, [], { rescheduleRoom: false, dayWindow: CREDIT_WINDOW, reuseOpenPage: true, skipDay }),
-    );
+    const sel = await selectRequestedSlot(app, testInfo, [], { bookingMinutes: BOOKING_MINUTES, rescheduleRoom: false, dayWindow: CREDIT_WINDOW, reuseOpenPage: true, skipDay });
     const modal = await app.openBookingModal(sel);
     await app.readPause();
     await app.selectGroupSize(modal, 1);
@@ -316,9 +360,7 @@ test.describe("Core membership: credit booking and discount booking @membership 
     // The first free time after 3 PM: credit hours are over, only the member discount applies
     // The calendar as it is (TC44 left it open; no reload)
     await toCalendar(app);
-    const sel = await withBookingMinutes(BOOKING_MINUTES, () =>
-      selectRequestedSlot(app, testInfo, [], { rescheduleRoom: false, dayWindow: DISCOUNT_WINDOW, reuseOpenPage: true }),
-    );
+    const sel = await selectRequestedSlot(app, testInfo, [], { bookingMinutes: BOOKING_MINUTES, rescheduleRoom: false, dayWindow: DISCOUNT_WINDOW, reuseOpenPage: true });
     const modal = await app.openBookingModal(sel);
     await app.readPause();
     await app.selectGroupSize(modal, 1);
@@ -500,9 +542,7 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @m
       return used + BOOKING_MINUTES / 15 > DAILY_CREDIT_SLOTS ? `member credit hours already used: ${formatHours(used)} of 2 hr` : null;
     };
     await toCalendar(app);
-    const sel = await withBookingMinutes(BOOKING_MINUTES, () =>
-      selectRequestedSlot(app, testInfo, [], { rescheduleRoom: false, dayWindow: creditHours(elite.plan), reuseOpenPage: true, skipDay }),
-    );
+    const sel = await selectRequestedSlot(app, testInfo, [], { bookingMinutes: BOOKING_MINUTES, rescheduleRoom: false, dayWindow: creditHours(elite.plan), reuseOpenPage: true, skipDay });
     const modal = await app.openBookingModal(sel);
     await app.readPause();
 
@@ -568,9 +608,7 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @m
     const wallet = await app.walletBalance();
     const percent = Number(elite.plan.discountPercent);
     await toCalendar(app);
-    const sel = await withBookingMinutes(BOOKING_MINUTES, () =>
-      selectRequestedSlot(app, testInfo, [], { rescheduleRoom: false, dayWindow: { from: creditHours(elite.plan).to, to: 24 * 60 }, reuseOpenPage: true }),
-    );
+    const sel = await selectRequestedSlot(app, testInfo, [], { bookingMinutes: BOOKING_MINUTES, rescheduleRoom: false, dayWindow: { from: creditHours(elite.plan).to, to: 24 * 60 }, reuseOpenPage: true });
     const modal = await app.openBookingModal(sel);
     await app.readPause();
     await app.selectGroupSize(modal, 2);
@@ -610,47 +648,7 @@ test.describe("Elite membership: upgrade, credit booking and discount booking @m
   test("TC52: My Booking -> cancel booking 2 -> refund shown and applied -> cancelled, slots free, credit unchanged", async ({}, testInfo) => {
     test.skip(!booking2, "TC51 did not create booking 2");
     const b = booking2!;
-    const page = app.page;
-    const before = await creditBalance(app);
-    await app.guidedClick(page.getByText("My Booking", { exact: true }).first(), { read: app.readMs });
-    await expect(page, "the My Booking page").toHaveURL(/\/my-bookings$/);
-
-    // Booking 2's card: bay, start time and length — and the date too when another of the user's bookings has the same.
-    // Exactly one card must be left, so that no other booking can be cancelled
-    let card = page
-      .locator("div.rounded-2xl.border-green-200:visible")
-      .filter({ has: page.getByRole("button", { name: "Modify", exact: true }) })
-      .filter({ hasText: new RegExp(`${b.bayName} – `) })
-      .filter({ hasText: pad12(b.startTime) })
-      .filter({ hasText: `${BOOKING_MINUTES} min` });
-    await expect(card.first(), `booking 2's card (${b.bayName}, ${pad12(b.startTime)})`).toBeVisible({ timeout: 20_000 });
-    if ((await card.count()) > 1) {
-      const month = headerLabel(b.date).split(" ")[0];
-      const days = compareDates(b.date, todayIn(app.tz)) / 86_400_000;
-      const near = days === 0 ? "|Today" : days === 1 ? "|Tomorrow" : "";
-      card = card.filter({ hasText: new RegExp(`${month}[a-z]* 0?${b.date.day}(?!\\d)|(?<!\\d)0?${b.date.day}(st|nd|rd|th)? ${month}${near}`) });
-    }
-    await expect(card, "exactly one card for booking 2").toHaveCount(1);
-    await app.guidedClick(card.getByRole("button", { name: "Modify", exact: true }), { read: app.readMs });
-    const menu = app.dialog("Manage your booking");
-    await expect(menu).toBeVisible();
-    await app.guidedClick(menu.getByRole("button", { name: "Cancel booking", exact: true }), { read: app.readMs });
-    const cancel = app.dialog("Confirm Cancellation");
-    await expect(cancel.getByRole("heading", { name: "Cancel Booking" }), "the cancel popup").toBeVisible();
-
-    const refund = await expectRefundShown(app, testInfo, cancel, b); // policy tier of what was paid
-    await clickAndExpectPatch(app, testInfo, cancel.getByRole("button", { name: "Confirm Cancellation" }), "cancel", b.bookingId);
-    suite.markCancelled();
-    await expect(cancel, "the cancel popup closes").toBeHidden({ timeout: 15_000 });
-    await expect(card, "the card is gone from My Booking").toHaveCount(0, { timeout: 20_000 });
-    const after = await app.fetchBooking(b.bookingId);
-    expect(after?.isCancelled, "saved as cancelled").toBe(true);
-    expect(Number(after?.metadata?.refundAmount ?? NaN), `refund applied: ${refund.percent}% of $${refund.paid.toFixed(2)}`).toBeCloseTo(refund.amount, 2);
-    expect(Number(after?.metadata?.cancellationFee ?? NaN), "cancellation fee = paid − refund").toBeCloseTo(round2(refund.paid - refund.amount), 2);
-    expect(await creditBalance(app), "credit neither deducted nor given back").toBeCloseTo(before, 2);
-    await showBookingEmail(app, testInfo, b, "cancelled");
-    await toCalendar(app);
-    await expectBookingGone(app, b);
+    await cancelOnMyBookingPage(app, testInfo, b, "booking 2", () => suite.markCancelled());
   });
 });
 
@@ -791,14 +789,13 @@ test.describe("Cancel and keep membership @membership @creates-booking", () => {
     // Benefits end with the period: only days before that date (in the location's time zone)
     const lastDay = todayIn(app.tz, new Date(start.currentPeriodEnd));
     await toCalendar(app);
-    const sel = await withBookingMinutes(BOOKING_MINUTES, () =>
-      selectRequestedSlot(app, testInfo, [], {
-        rescheduleRoom: false,
-        dayWindow: { from: creditHours(plan).to, to: 24 * 60 },
-        reuseOpenPage: true,
-        skipDay: (d) => (compareDates(d, lastDay) >= 0 ? `the membership ends on ${isoDate(lastDay)}` : null),
-      }),
-    );
+    const sel = await selectRequestedSlot(app, testInfo, [], {
+      bookingMinutes: BOOKING_MINUTES,
+      rescheduleRoom: false,
+      dayWindow: { from: creditHours(plan).to, to: 24 * 60 },
+      reuseOpenPage: true,
+      skipDay: (d) => (compareDates(d, lastDay) >= 0 ? `the membership ends on ${isoDate(lastDay)}` : null),
+    });
     const modal = await app.openBookingModal(sel);
     await app.readPause();
     await app.selectGroupSize(modal, 1);
@@ -836,45 +833,7 @@ test.describe("Cancel and keep membership @membership @creates-booking", () => {
   test("TC56: My Booking -> cancel that booking -> refund shown and applied -> cancelled, slots free, credit unchanged", async ({}, testInfo) => {
     test.skip(!booking, "TC55 did not create the booking");
     const b = booking!;
-    const page = app.page;
-    const before = await creditBalance(app);
-    await app.guidedClick(page.getByText("My Booking", { exact: true }).first(), { read: app.readMs });
-    await expect(page, "the My Booking page").toHaveURL(/\/my-bookings$/);
-    // Exactly one card must match (as in TC52), so that no other booking can be cancelled
-    let card = page
-      .locator("div.rounded-2xl.border-green-200:visible")
-      .filter({ has: page.getByRole("button", { name: "Modify", exact: true }) })
-      .filter({ hasText: new RegExp(`${b.bayName} – `) })
-      .filter({ hasText: pad12(b.startTime) })
-      .filter({ hasText: `${BOOKING_MINUTES} min` });
-    await expect(card.first(), `the booking's card (${b.bayName}, ${pad12(b.startTime)})`).toBeVisible({ timeout: 20_000 });
-    if ((await card.count()) > 1) {
-      const month = headerLabel(b.date).split(" ")[0];
-      const days = compareDates(b.date, todayIn(app.tz)) / 86_400_000;
-      const near = days === 0 ? "|Today" : days === 1 ? "|Tomorrow" : "";
-      card = card.filter({ hasText: new RegExp(`${month}[a-z]* 0?${b.date.day}(?!\\d)|(?<!\\d)0?${b.date.day}(st|nd|rd|th)? ${month}${near}`) });
-    }
-    await expect(card, "exactly one card for the booking").toHaveCount(1);
-    await app.guidedClick(card.getByRole("button", { name: "Modify", exact: true }), { read: app.readMs });
-    const menu = app.dialog("Manage your booking");
-    await expect(menu).toBeVisible();
-    await app.guidedClick(menu.getByRole("button", { name: "Cancel booking", exact: true }), { read: app.readMs });
-    const cancel = app.dialog("Confirm Cancellation");
-    await expect(cancel.getByRole("heading", { name: "Cancel Booking" }), "the cancel popup").toBeVisible();
-
-    const refund = await expectRefundShown(app, testInfo, cancel, b); // policy tier of what was paid
-    await clickAndExpectPatch(app, testInfo, cancel.getByRole("button", { name: "Confirm Cancellation" }), "cancel", b.bookingId);
-    suite.markCancelled();
-    await expect(cancel, "the cancel popup closes").toBeHidden({ timeout: 15_000 });
-    await expect(card, "the card is gone from My Booking").toHaveCount(0, { timeout: 20_000 });
-    const after = await app.fetchBooking(b.bookingId);
-    expect(after?.isCancelled, "saved as cancelled").toBe(true);
-    expect(Number(after?.metadata?.refundAmount ?? NaN), `refund applied: ${refund.percent}% of $${refund.paid.toFixed(2)}`).toBeCloseTo(refund.amount, 2);
-    expect(Number(after?.metadata?.cancellationFee ?? NaN), "cancellation fee = paid − refund").toBeCloseTo(round2(refund.paid - refund.amount), 2);
-    expect(await creditBalance(app), "credit neither deducted nor given back").toBeCloseTo(before, 2);
-    await showBookingEmail(app, testInfo, b, "cancelled");
-    await toCalendar(app);
-    await expectBookingGone(app, b);
+    await cancelOnMyBookingPage(app, testInfo, b, "the booking", () => suite.markCancelled());
   });
 
   test("TC57: Keep my membership -> keeps renewing -> active Elite as before", async ({}, testInfo) => {

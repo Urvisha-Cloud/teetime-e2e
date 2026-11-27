@@ -9,6 +9,7 @@ import {
   bookingSuite,
   cancelInUi,
   chooseNewTime,
+  rescheduleTimes,
   confirmChangeDetails,
   continueExtend,
   expectBookingGone,
@@ -30,7 +31,7 @@ import { dueBeforeWallet, paidWith, refundSplit, round2 } from "../money";
  * applied by itself (My Wallet: "Credits auto-apply on your next booking"; Booking Details has no switch for it).
  *
  *  TC25  only when the wallet is empty: sidebar "My Wallet" -> "Redeem Gift" -> the "Redeem gift card" modal -> a popup
- *         asks YOU for the gift card code (e.g. from admin; headless runs use TEETIME_GIFT_CARD_CODE) -> the code is
+ *         asks YOU for the gift card code (e.g. from admin; headless runs use TEETIME_REDEEM_GIFT_CODE) -> the code is
  *         typed into "Gift code" -> Redeem -> the wallet balance goes up by the card's value -> back to "Book Your Bay".
  *         The wallet already has credit -> nothing to redeem (TC26 uses it). Popup "Skip" -> no redeem, TC26 pays by card.
  *         A refused code (used up, invalid) -> skipped with the app's message; TC26 then pays by card.
@@ -74,7 +75,8 @@ test.describe("Wallet credit, otherwise card: create -> reschedule -> group size
       console.log(`[teetime-e2e] wallet: ${note}`);
       return;
     }
-    test.skip(headless && !env.giftCardCode, "Empty wallet, headless run without TEETIME_GIFT_CARD_CODE: nothing to redeem (TC26 pays by card)");
+    // Its own card: redeeming moves the whole balance into the wallet, so the gift card cases' card must not be used here
+    test.skip(headless && !env.redeemGiftCode, "Empty wallet, headless run without TEETIME_REDEEM_GIFT_CODE: nothing to redeem (TC26 pays by card)");
     const page = app.page;
 
     // Sidebar "My Wallet" -> "Redeem Gift" -> the "Redeem gift card" modal
@@ -87,8 +89,8 @@ test.describe("Wallet credit, otherwise card: create -> reschedule -> group size
     const field = dialog.getByPlaceholder(/gift code/i);
     const redeem = dialog.getByRole("button", { name: /^Redeem$/i });
 
-    // The popup asks YOU for the code (headless: TEETIME_GIFT_CARD_CODE) -> typed into "Gift code" -> Redeem
-    const code = headless ? env.giftCardCode : await askGiftCode(app, testInfo, dialog, { primaryButton: redeem, target: '"Gift code"' });
+    // The popup asks YOU for the code (headless: TEETIME_REDEEM_GIFT_CODE) -> typed into "Gift code" -> Redeem
+    const code = headless ? env.redeemGiftCode : await askGiftCode(app, testInfo, dialog, { primaryButton: redeem, target: '"Gift code"' });
     test.skip(!code, "No gift card code entered in the popup: nothing redeemed (TC26 pays by card)");
     await app.guidedClick(field);
     await field.pressSequentially(code, { delay: GIFT_CODE_KEY_DELAY_MS });
@@ -217,7 +219,8 @@ test.describe("Wallet credit, otherwise card: create -> reschedule -> group size
     await app.viewMyBooking(booking!); // TC26 left the Booking Confirmed screen open
     await changePaidByWallet(testInfo, "reschedule", async () => {
       await startReschedule(app, booking!);
-      const next = await chooseNewTime(app, booking!, env.rescheduleStart, env.rescheduleEnd);
+      const { startTime, endTime } = rescheduleTimes(booking!); // the 2 hr right after the booking
+      const next = await chooseNewTime(app, booking!, startTime, endTime);
       await confirmChangeDetails(app, testInfo, "reschedule", next, { pickGroupSize: true });
       return next;
     });

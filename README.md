@@ -25,6 +25,11 @@ TEETIME_CLEANUP=true
 Keep `TEETIME_API_URL` ending in **`/v1`** (`https://dev-booking-api.teetimeindoorgolf.com/v1`); without it the
 cleanup cancel call gets HTTP 404 and test bookings stay active.
 
+**Gift cards:** visible runs ask for each gift card code in a popup. Headless runs read them from `.env` and need
+three different cards, because each step needs a different balance: `TEETIME_GIFT_CARD_CODE` (gift card checkout
+TC35–40: booking + reschedule + extension, at least the price of 2.5 hours at the bay), `TEETIME_SMALL_GIFT_CARD_CODE` (TC33–34: a few dollars, so
+the card still pays a part) and `TEETIME_REDEEM_GIFT_CODE` (TC25: redeemed into the wallet, which uses it up).
+
 **Login modes (`TEETIME_AUTH_MODE` in .env):**
 
 * `signup` (default): **one test user, reused across runs.** The first run signs up `teetime-e2e-<timestamp>@yopmail.com`
@@ -59,7 +64,7 @@ fixed test OTP for the test account, set `TEETIME_TEST_OTP` and it logs in by it
 | The main run: every step in `tests/main`, in the order `tests/main.spec.ts` imports them (creating tests need `TEETIME_ALLOW_BOOKING_CREATION=true`) | `npm test` |
 | The main run without the watching pauses, cursor and YopMail window | `npm run test:fast` |
 | One step of the main run (e.g. the wallet cases) | `npm run test:wallet` (all in [COMMANDS.md](COMMANDS.md)) |
-| Any one test by its number, visible | `npm run test:one -- "TC21:"` |
+| Any one test by its number, visible | `npm run test:one -- TC21` |
 | Visual runner | `npm run test:ui` |
 | One case | `npx playwright test -g "TC2:" --headed` |
 | Step-by-step debug | `npx playwright test -g "TC1:" --debug` |
@@ -99,6 +104,44 @@ table in [COMMANDS.md](COMMANDS.md). They live in `tests/main`, one file per ste
 | `wallet-gift-card.ts` (`@wallet-gift-card`) | TC33 wallet + gift card, TC34 card + wallet + gift card (each booked and cancelled) |
 | `gift-card.ts` (`@gift-card`) | TC35–40 gift card: create → reschedule → extend → cancel |
 | `membership.ts` (`@membership`) | TC41–57 Core, Elite upgrade, cancel and keep membership |
+
+## Code layout
+
+| Where | What |
+|---|---|
+| `tests/main.spec.ts` | The main run: imports the step files in run order |
+| `tests/main/*.ts` | One file per step (the test cases) |
+| `tests/helper.ts` | Re-exports every helper; the step files import from here |
+| `tests/helpers/` | The helpers by area: `suite` (setup, cleanup), `slots` (free-slot search, booking times), `payment` (wallet, member credit), `create`, `gift-card`, `change` (⋮ menu, reschedule, group size, extend), `cancel` (refund policy), `email` (YopMail window) |
+| `tests/fixtures.ts`, `tests/money.ts` | The shared window and login; money and refund math |
+| `support/booking-app.ts` | `BookingApp`, the page object of the booking site (calendar, Booking Details, checkout) |
+| `support/booking-api.ts` | `BookingApi`, the backend calls BookingApp builds on (wallet, gift card, membership, a booking, cancel) |
+| `support/booking-types.ts` | Shared shapes: a selected / created booking, the calendar, `BlockedError` |
+| `support/env.ts` | The settings from `.env`, read once and frozen: a test never changes them for the next one |
+
+Selectors use roles, labels, text, the app's data attributes (`data-screen` / `data-slot`) and its API data, not
+styling classes, so a design change in booking-ui does not break them. One exception: the calendar shows that a booking
+is the user's OWN only by its green outline, so that one class is read, from one place (`OWN_BOOKING_STYLE` in
+`support/booking-app.ts`); a data attribute on the slot in booking-ui would replace it.
+
+## Nightly run (CI)
+
+`.github/workflows/nightly-e2e.yml` runs all 57 cases headless against dev every night at 13:00 UTC (3 AM in
+Honolulu, when the day's credit hours and refund windows are still ahead), and on demand (Actions → Nightly E2E → Run
+workflow). A run without a window is a fast run by itself. It needs these in the GitHub repository (Settings → Secrets
+and variables → Actions):
+
+| Kind | Name | Value |
+|---|---|---|
+| Secret | `TEETIME_TEST_OTP` | The dev backend's fixed test code |
+| Variable | `TEETIME_STRIPE_TEST_CARD`, `_EXP`, `_CVC`, `_ZIP` | Stripe's published test card |
+| Secret (optional) | `TEETIME_GIFT_CARD_CODE`, `TEETIME_SMALL_GIFT_CARD_CODE`, `TEETIME_REDEEM_GIFT_CODE` | Three gift cards (see "Gift cards"); empty or used up -> those steps are skipped |
+| Variable (optional) | `TEETIME_BASE_URL`, `TEETIME_API_URL` | Other dev hosts (default: the dev site and API) |
+
+It books and pays on dev like `npm test` and cancels what it books (`TEETIME_CLEANUP=true`). The test user's email is
+kept between nights (cache), so the same user logs in every night. The HTML report and the traces are an artifact of
+each run (14 days). Gift cards are used up over the nights (redeemed, or 10% kept per cancellation): top them up in
+admin, or the gift card steps are skipped.
 
 ## How the app behaves (from code analysis)
 

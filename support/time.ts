@@ -101,3 +101,20 @@ export function slotRange(start: string, end: string): { startIdx: number; endId
 
 /** "8:00 PM" -> "08:00 PM" (checkout page uses hh:mm A). */
 export const pad12 = (t: string) => t.replace(/^(\d):/, "0$1:");
+
+/** Local wall-clock (date + minutes after midnight) in `tz` -> UTC epoch ms. */
+export function zonedToUtcMs(date: LocalDate, minutes: number, tz: string): number {
+  const guess = Date.UTC(date.year, date.month - 1, date.day, 0, minutes);
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).formatToParts(new Date(guess));
+  const get = (t: string) => Number(parts.find((p) => p.type === t)!.value);
+  const asIfUtc = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"));
+  return guess - (asIfUtc - guess);
+}

@@ -48,6 +48,9 @@ import { dueBeforeWallet, giftTotal, paidWith, round2 } from "../money";
  *
  * Popup "Skip" (or no code within 5 min) -> TC36–40 and TC39 are skipped. Headless runs show no popup: they use
  * TEETIME_GIFT_CARD_CODE, and are skipped without it. The booking is cancelled afterwards (TEETIME_CLEANUP=true).
+ * The one gift card pays the booking, the reschedule and the extension, so it needs the price of that time (2.5 hours
+ * at the bay): TC36 works it out from the price Booking Details shows, checks the card's balance and warns when it has
+ * less (the card then pays what the gift card cannot).
  */
 
 /** TC38 reschedules the booking to its own time plus this many hours right after it. */
@@ -143,6 +146,23 @@ test.describe("Gift card at checkout @gift-card @creates-booking", () => {
       testInfo.annotations.push({ type: "warning", description: warning });
       console.log(`[teetime-e2e] WARNING: ${warning}`);
     }
+    // The same gift card also pays the reschedule (TC38: RESCHEDULE_EXTRA_HOURS more) and the extension (TC39). Too little
+    // on it is only a warning: once it is used up the card pays those differences instead
+    const perHour = price / ((sel.endIdx + 1 - sel.startIdx) / 4);
+    const needed = round2(price - walletPart + perHour * (RESCHEDULE_EXTRA_HOURS + extraSlots / 4));
+    const { balance: giftBalance } = await app.giftCard(giftCode);
+    testInfo.annotations.push({
+      type: "gift-card-balance",
+      description: `${giftCode}: $${giftBalance.toFixed(2)} left; booking + reschedule + extension need about $${needed.toFixed(2)}`,
+    });
+    if (giftBalance < needed) {
+      const warning =
+        `gift card ${giftCode} has $${giftBalance.toFixed(2)} left, but the booking, the reschedule (TC38) and the extension ` +
+        `(TC39) need about $${needed.toFixed(2)}: use a gift card with at least that much (in the popup, or ` +
+        "TEETIME_GIFT_CARD_CODE). Once it is used up the card pays the rest, so TC38–39 do not test the gift card.";
+      testInfo.annotations.push({ type: "warning", description: warning });
+      console.log(`[teetime-e2e] WARNING: ${warning}`);
+    }
     await app.readPause();
 
     // waiver -> the card pays the rest, if any -> Confirm -> Booking Confirmed -> the booking email
@@ -170,6 +190,7 @@ test.describe("Gift card at checkout @gift-card @creates-booking", () => {
     const startTime = b.startTime;
     const endTime = fromMinutes((b.endIdx + 1 + RESCHEDULE_EXTRA_HOURS * 4) * 15);
     testInfo.annotations.push({ type: "reschedule", description: `${b.startTime}–${b.endTime} -> ${startTime}–${endTime}` });
+    const leftBefore = (await app.giftCard(giftCode)).balance; // for the failure message: what the backend can take
     await startReschedule(app, b);
     const next = await chooseNewTime(app, b, startTime, endTime); // same bay and group size, longer
     // Reschedule details: the longer time costs more — the gift card code pays the difference ("Have a gift card?"),
@@ -186,7 +207,13 @@ test.describe("Gift card at checkout @gift-card @creates-booking", () => {
       type: "reschedule-payment",
       description: `difference: gift card $${giftNow.toFixed(2)}; saved: ${JSON.stringify({ wallet: p.walletAmount, gift: p.giftCards, card: p.cardAmount })}`.slice(0, 300),
     });
-    if (giftNow > 0) expect(round2(gifts), "gift card total = at booking + the reschedule difference").toBeCloseTo(round2(giftPaid + giftNow), 2);
+    if (giftNow > 0) {
+      expect(
+        round2(gifts),
+        `gift card total = at booking + the reschedule difference (Reschedule details took $${giftNow.toFixed(2)} from the ` +
+          `gift card; it had $${leftBefore.toFixed(2)} left before the reschedule)`,
+      ).toBeCloseTo(round2(giftPaid + giftNow), 2);
+    }
     await app.viewMyBooking(booking); // every slot from the start to the new end belongs to the booking
   });
 
@@ -194,6 +221,7 @@ test.describe("Gift card at checkout @gift-card @creates-booking", () => {
     test.skip(!rescheduled, "TC38 did not reschedule the booking");
     const gifts = async () => giftTotal((await app.fetchBooking(booking!.bookingId))?.paymentBreakdown);
     const before = await gifts();
+    const leftBefore = (await app.giftCard(giftCode)).balance; // for the failure message: what the backend can take
     const popup = await openExtendPopup(app, booking!);
     await app.guidedClick(popup.getByRole("button", { name: env.extendBy, exact: true }));
     const next = await continueExtend(app, popup, booking!, extraSlots);
@@ -202,7 +230,10 @@ test.describe("Gift card at checkout @gift-card @creates-booking", () => {
     extended = true;
     const giftNow = round2(gift ? gift.before - gift.after : 0);
     testInfo.annotations.push({ type: "extend-payment", description: `gift card $${giftNow.toFixed(2)}, card $${(gift?.after ?? 0).toFixed(2)}` });
-    expect(round2((await gifts()) - before), "the gift card paid what Extend details showed").toBeCloseTo(giftNow, 2);
+    expect(
+      round2((await gifts()) - before),
+      `the gift card paid what Extend details showed (it had $${leftBefore.toFixed(2)} left before the extension)`,
+    ).toBeCloseTo(giftNow, 2);
     await app.viewMyBooking(booking);
   });
 

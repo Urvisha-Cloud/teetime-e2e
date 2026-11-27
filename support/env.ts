@@ -6,37 +6,44 @@ dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
 const str = (name: string, fallback = ""): string =>
   (process.env[name] ?? fallback).trim();
 
-/** Fast run (npm run test:fast): every pause that is only there to watch the run is 0, whatever .env says. */
-const fast = str("TEETIME_FAST").toLowerCase() === "true";
+/**
+ * Fast run: every pause that is only there to watch the run is 0, whatever .env says. npm run test:fast
+ * (TEETIME_FAST=true), and every run without a window (TEETIME_WATCHED=0, set by playwright.config.ts): nobody watches.
+ */
+const fast = str("TEETIME_FAST").toLowerCase() === "true" || process.env.TEETIME_WATCHED === "0";
 /** A pause for watching the run (ms); 0 in a fast run or when empty. */
 const watchMs = (name: string, fallback: string): number => (fast ? 0 : Number(str(name, fallback)) || 0);
 
 /** Hosts that count as non-production. Anything else is treated as production. */
 const NON_PROD_HOST = /^(localhost|127\.0\.0\.1|\[::1\])$|(^|[.-])(dev|develop|staging|stage|qa|test|uat)[.-]|\.localhost$|\.test$/i;
 
-export const env = {
+/**
+ * The run's settings, read once from .env. Frozen: tests never write here (a booking's times travel with the booking,
+ * a different length is an option of selectRequestedSlot), so no step depends on what an earlier step left behind.
+ */
+export const env = Object.freeze({
   baseURL: str("TEETIME_BASE_URL", "https://dev-booking.teetimeindoorgolf.com").replace(/\/$/, ""),
   apiURL: str("TEETIME_API_URL", "https://dev-booking-api.teetimeindoorgolf.com").replace(/\/$/, ""),
   allowBookingCreation: str("TEETIME_ALLOW_BOOKING_CREATION") === "true",
-
   locationName: str("TEETIME_LOCATION_NAME", "Tee Time - Honolulu"),
   /** Length of the test booking, and of the reschedule time (which starts right where the booking ends). */
   bookingMinutes: 60,
   rescheduleMinutes: 120,
-  slotStart: "",
-  slotEnd: "",
-  rescheduleStart: "",
-  rescheduleEnd: "",
-  /** Quick pick pressed in the "Extend Booking" popup: "+30 min", "+1 hr", "+2 hr" or "+3 hr". */
   extendBy: str("TEETIME_EXTEND_BY", "+30 min"),
-  /** New group size for the group-size update steps (players can only be added: more than the booking has, max 5). */
   groupSizeUpdate: Number(str("TEETIME_GROUP_SIZE_UPDATE", "5")) || 5,
   daysAhead: Number(str("TEETIME_DAYS_AHEAD", "0")),
   minLeadMinutes: Number(str("TEETIME_MIN_LEAD_MINUTES", "270")),
   browserTz: str("TEETIME_BROWSER_TZ", "Pacific/Honolulu"),
 
   testEmail: str("TEETIME_TEST_EMAIL"),
+  // Gift cards for headless runs (headed runs ask for each code in a popup). Three different cards, because each step
+  // needs a different balance and TC25 uses its card up:
+  /** Gift card checkout (TC35–40): enough balance for the booking, the reschedule and the extension (2.5 hours' price). */
   giftCardCode: str("TEETIME_GIFT_CARD_CODE"),
+  /** Wallet + gift card (TC33–34): a small balance, so the card still pays a part in TC34. */
+  smallGiftCardCode: str("TEETIME_SMALL_GIFT_CARD_CODE"),
+  /** Redeemed into the wallet (TC25): its whole balance moves to the wallet, so this card is used up. */
+  redeemGiftCode: str("TEETIME_REDEEM_GIFT_CODE"),
   testOtp: str("TEETIME_TEST_OTP"),
 
   authMode: (str("TEETIME_AUTH_MODE", "signup") === "saved" ? "saved" : "signup") as "signup" | "saved",
@@ -58,20 +65,14 @@ export const env = {
     zip: str("TEETIME_STRIPE_TEST_ZIP"),
   },
   cleanup: str("TEETIME_CLEANUP") === "true",
-  /** TEETIME_FAST=true (npm run test:fast): the same checks without the watching extras below, so a run is minutes shorter. */
   fast,
-  /** How long the journey test keeps the confirmation screen and the booked calendar on screen (ms). */
   showMs: watchMs("TEETIME_SHOW_MS", "3000"),
   emailArriveMs: watchMs("TEETIME_EMAIL_ARRIVE_MS", "1000"),
-  /** The same for a NEW booking's email, which takes longer to arrive. */
   newBookingEmailArriveMs: watchMs("TEETIME_NEW_BOOKING_EMAIL_ARRIVE_MS", "8000"),
-  /** Watching a headed run: pause on each modal so it can be read. 0 = no pauses. */
   readMs: watchMs("TEETIME_READ_MS", "1000"),
-  /** Draw a visible mouse cursor (arrow + click pulse) in the test browser; Playwright's window shows none. */
   showCursor: !fast && str("TEETIME_SHOW_CURSOR", "true").toLowerCase() !== "false",
-  /** Bring each booking email up in a YopMail window (headed runs; the test never reads it). Off: TEETIME_SHOW_EMAILS=false. */
   showEmails: !fast && str("TEETIME_SHOW_EMAILS", "true").toLowerCase() !== "false",
-};
+});
 
 export function isNonProductionHost(url: string): boolean {
   try {

@@ -5,7 +5,8 @@ import { test } from "../fixtures";
 /**
  * Main run, step 1 (card): cancel a booking starting 1–4 hours from now -> 50% refund, and one starting within 1 hour
  * -> no refund. Each checks the popup, confirms the cancellation straight away, then checks the refund the backend
- * applied and that the booking is gone (each skips itself when no such time is free today).
+ * applied and that the booking is gone. Late in the evening the start can be after midnight; each skips itself when no
+ * such time is free.
  */
 
 // ───────────────────────────── refund policy ─────────────────────────────
@@ -19,7 +20,10 @@ type RefundCase = {
   name: string;
   /** Refund percent the popup must show (REFUND_TIERS). */
   percent: number;
-  /** Where to book it; todayWindow keeps the start inside one tier with room to spare at both ends. */
+  /**
+   * Where to book it: startWithin keeps the start inside one tier with room to spare at both ends; tryNextDays 1 lets it
+   * be after midnight (late in the evening); rescheduleRoom false, because these bookings are never rescheduled.
+   */
   slot: Parameters<typeof selectRequestedSlot>[3];
 };
 
@@ -27,13 +31,13 @@ const REFUND_50: RefundCase = {
   first: 13,
   name: "1–4 hours before the start: 50% refund",
   percent: 50,
-  slot: { tryNextDays: 0, todayWindow: { min: 80, max: 220 } },
+  slot: { tryNextDays: 1, startWithin: { min: 80, max: 220 }, rescheduleRoom: false },
 };
 const REFUND_NONE: RefundCase = {
   first: 16,
   name: "within 1 hour of the start: no refund",
   percent: 0,
-  slot: { tryNextDays: 0, todayWindow: { min: 15, max: 45 } },
+  slot: { tryNextDays: 1, startWithin: { min: 15, max: 45 }, rescheduleRoom: false },
 };
 
 /** Three tests for one refund case: book a slot that starts at the right time -> cancel (popup + applied refund) -> gone. */

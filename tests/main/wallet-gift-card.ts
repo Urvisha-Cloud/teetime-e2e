@@ -28,7 +28,7 @@ import { dueBeforeWallet, paidWith, refundSplit, round2 } from "../money";
  *
  *  TC33  wallet + gift card: the wallet has a small credit (WALLET; otherwise a popup asks you to set it in admin, the test
  *         goes on by itself) -> book a free hour -> Booking Details: "Wallet credits" in the price -> popup: you type the
- *         gift card code (headless: TEETIME_GIFT_CARD_CODE) -> "Have a gift card?" -> Apply -> the gift card pays the
+ *         gift card code (headless: TEETIME_SMALL_GIFT_CARD_CODE) -> "Have a gift card?" -> Apply -> the gift card pays the
  *         rest (the card what it does not cover) -> waiver -> Confirm -> Booking Confirmed. Saved: wallet, gift card and
  *         card parts as shown; the wallet and the gift card are down by their part. Then cancel it (90% refund): the
  *         cancel popup shows a refund line per way of payment -> Confirm cancellation -> the refunds saved on the
@@ -152,11 +152,11 @@ test.describe("Wallet + gift card: create -> cancel, both refunded @wallet-gift-
   test("TC33: create booking with wallet + gift card -> both apply -> Booking Confirmed -> cancel -> wallet and gift card both refunded", async ({ headless }, testInfo) => {
     requireBookingCreation();
     testInfo.setTimeout(testInfo.timeout * 2); // one case: the booking and its cancellation
-    test.skip(headless && !env.giftCardCode, "Headless run without a gift card code: set TEETIME_GIFT_CARD_CODE in .env (or run --headed)");
+    test.skip(headless && !env.smallGiftCardCode, "Headless run without a small gift card: set TEETIME_SMALL_GIFT_CARD_CODE in .env (or run --headed)");
     const wallet = await ensureSmallWallet(app, testInfo, WALLET);
     const { sel, modal } = await openWithWallet(app, testInfo, wallet);
     // The gift card pays what is left, the card only what the gift card does not cover
-    const { code, before, after } = await askAndApplyGiftCode(app, testInfo, modal, headless);
+    const { code, before, after } = await askAndApplyGiftCode(app, testInfo, modal, headless, env.smallGiftCardCode);
     usedGiftCode = code;
     paid = await confirmPaid(app, suite, testInfo, modal, sel, { giftCode: code, wallet, gift: round2(before - after), card: after });
 
@@ -173,7 +173,7 @@ test.describe("Card + wallet + gift card: create -> cancel, all refunded @wallet
   test("TC34: create booking with card + wallet + gift card -> all three pay a part -> Booking Confirmed -> cancel -> card, wallet and gift card all refunded", async ({ headless }, testInfo) => {
     requireBookingCreation();
     testInfo.setTimeout(testInfo.timeout * 2); // one case: the booking and its cancellation
-    test.skip(headless && !env.giftCardCode, "Headless run without a gift card code: set TEETIME_GIFT_CARD_CODE in .env (or run --headed)");
+    test.skip(headless && !env.smallGiftCardCode, "Headless run without a small gift card: set TEETIME_SMALL_GIFT_CARD_CODE in .env (or run --headed)");
     const wallet = await ensureSmallWallet(app, testInfo, WALLET);
     const { sel: hour, modal, price: perHour } = await openWithWallet(app, testInfo, wallet, (MAX_HOURS - 1) * 4);
     // What the card gets back of a booking for `price`: price − wallet − the whole gift card − the fee
@@ -190,7 +190,7 @@ test.describe("Card + wallet + gift card: create -> cancel, all refunded @wallet
         attempt === 0
           ? usedGiftCode
           : headless
-            ? env.giftCardCode!
+            ? env.smallGiftCardCode!
             : await askGiftCode(app, testInfo, modal, { hint: `${problem ? `${problem}. ` : ""}The card must pay too: use a code with up to $${maxGift.toFixed(2)} left.` });
       test.skip(!code, "No gift card code entered in the popup");
       const card = await app.giftCard(code);

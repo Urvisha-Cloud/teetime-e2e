@@ -1,6 +1,6 @@
 import type { BookingApp, CreatedBooking } from "../../support/booking-app";
 import { env } from "../../support/env";
-import { addPlayers, bookFreeSlot, bookingSuite, cancelInUi, chooseNewTime, confirmChangeDetails, continueExtend, exerciseExtendControls, expectBookingGone, expectConfirmed, expectPaidByCard, openExtendPopup, presetSlots, requireBookingCreation, startReschedule, rescheduleSlotsRange } from "../helper";
+import { addPlayers, bookFreeSlot, bookingSuite, cancelInUi, chooseNewTime, confirmChangeDetails, continueExtend, exerciseExtendControls, expectBookingGone, expectConfirmed, expectPaidByCard, openExtendPopup, presetSlots, requireBookingCreation, rescheduleTimes, startReschedule, rescheduleSlotsRange } from "../helper";
 import { expect, test, testUser } from "../fixtures";
 
 test.describe("Booking flow: login -> create -> reschedule -> group size -> extend -> cancel @card-flow @creates-booking", () => {
@@ -44,7 +44,8 @@ test.describe("Booking flow: login -> create -> reschedule -> group size -> exte
   test(`TC3: reschedule — new time (the 2 hr after the booking), same group size -> Booking Confirmed -> calendar`, async ({}, testInfo) => {
     test.skip(!booking, "TC2 did not create a booking");
     await startReschedule(app, booking!);
-    const after = await chooseNewTime(app, booking!, env.rescheduleStart, env.rescheduleEnd); // group size unchanged; TC4 changes it
+    const { startTime, endTime } = rescheduleTimes(booking!); // the 2 hr right after the booking
+    const after = await chooseNewTime(app, booking!, startTime, endTime); // group size unchanged; TC4 changes it
     await confirmChangeDetails(app, testInfo, "reschedule", after, { pickGroupSize: true });
     booking = after;
     rescheduled = true;

@@ -1,5 +1,5 @@
 import type { TestInfo } from "@playwright/test";
-import type { BaySlotState, BookingApp, CreatedBooking, SelectedBooking } from "../../support/booking-app";
+import { type BaySlotState, type BookingApp, type CreatedBooking, type SelectedBooking, durationValue } from "../../support/booking-app";
 import { env } from "../../support/env";
 import { fromMinutes } from "../../support/time";
 import {
@@ -125,14 +125,14 @@ async function pickBayAndContinue(
     startTime: f.endTime,
     endTime: fromMinutes((hour.endIdx + 1) * 15),
   };
-  await expect(picked.locator("div.text-2xl"), "session length").toHaveText(formatMinutes(HOUR * 15));
+  await expect(durationValue(picked, "session length"), "session length").toHaveText(formatMinutes(HOUR * 15));
   await expect(picked, "preview: bay and time").toContainText(`${next.bayName} · ${next.startTime} – ${next.endTime}`);
   await app.guidedClick(picked.getByRole("button", { name: /Continue/ }), { read: app.readMs });
   await expect(picked).toBeHidden();
 
   // Continue selects the new session on that bay, then the app opens Booking Details right away
   // (bay, time and date filled in); the header's Book Now is behind it, so check the modal instead.
-  for (let s = next.startIdx; s <= next.endIdx; s++) await expect(app.cell(next.bayId, s)).toHaveClass(/bg-green-400\/50/);
+  await app.expectSelection(next.bayId, next.startIdx, next.endIdx);
   const modal = app.modal();
   if (await modal.isVisible({ timeout: 5000 }).catch(() => false)) {
     await expect(modal.getByRole("heading", { name: "Booking Details" })).toBeVisible();

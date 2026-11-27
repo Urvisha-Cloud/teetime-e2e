@@ -1,0 +1,73 @@
+# Nightly run of the whole suite (npm test's 57 cases) against DEV, headless.
+# A run without a window is a fast run by itself (no reading pauses, cursor or YopMail window), and needs every
+# setting from the repository's Actions secrets / variables instead of .env (Settings → Secrets and variables →
+# Actions). The run books real dev bays, pays with Stripe's published TEST card and cancels what it books
+# (TEETIME_CLEANUP=true); playwright.config.ts refuses to start against anything that is not dev/staging/local.
+name: Nightly E2E (dev)
+
+on:
+  schedule:
+    # 13:00 UTC = 3:00 AM in Honolulu: the day's member credit hours (1 AM – 3 PM), the time after them and the
+    # refund windows (1–4 h ahead, < 1 h ahead) are all still ahead.
+    - cron: "0 13 * * *"
+  workflow_dispatch: {}
+
+# One run at a time: the tests share the dev bays
+concurrency:
+  group: teetime-e2e-dev
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      TEETIME_BASE_URL: ${{ vars.TEETIME_BASE_URL || 'https://dev-booking.teetimeindoorgolf.com' }}
+      TEETIME_API_URL: ${{ vars.TEETIME_API_URL || 'https://dev-booking-api.teetimeindoorgolf.com/v1' }}
+      TEETIME_ALLOW_BOOKING_CREATION: "true"
+      TEETIME_CLEANUP: "true"
+      TEETIME_BROWSER: chrome
+      # One test user, reused across nights (its email is kept in the cache below); the dev backend's fixed code
+      TEETIME_AUTH_MODE: signup
+      TEETIME_TEST_OTP: ${{ secrets.TEETIME_TEST_OTP }}
+      # Stripe's published test card (variables): TEETIME_STRIPE_TEST_CARD / EXP / CVC / ZIP
+      TEETIME_PAYMENT_MODE: test-card
+      TEETIME_STRIPE_TEST_CARD: ${{ vars.TEETIME_STRIPE_TEST_CARD }}
+      TEETIME_STRIPE_TEST_EXP: ${{ vars.TEETIME_STRIPE_TEST_EXP }}
+      TEETIME_STRIPE_TEST_CVC: ${{ vars.TEETIME_STRIPE_TEST_CVC }}
+      TEETIME_STRIPE_TEST_ZIP: ${{ vars.TEETIME_STRIPE_TEST_ZIP }}
+      # Three different gift cards (see README "Gift cards"); a step whose code is empty or used up is skipped
+      TEETIME_GIFT_CARD_CODE: ${{ secrets.TEETIME_GIFT_CARD_CODE }}
+      TEETIME_SMALL_GIFT_CARD_CODE: ${{ secrets.TEETIME_SMALL_GIFT_CARD_CODE }}
+      TEETIME_REDEEM_GIFT_CODE: ${{ secrets.TEETIME_REDEEM_GIFT_CODE }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # The test user's email from the last night (.auth/e2e-user.json), so every night logs in the same user
+      # instead of signing up a new one. Only the email is kept, no login.
+      - uses: actions/cache@v4
+        with:
+          path: .auth/e2e-user.json
+          key: teetime-e2e-user-${{ github.run_id }}
+          restore-keys: teetime-e2e-user-
+
+      # Google Chrome is already installed on GitHub's Ubuntu runners (the tests use channel "chrome")
+      - name: Run the suite (headless)
+        run: npx playwright test tests/main.spec.ts
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ github.run_number }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14

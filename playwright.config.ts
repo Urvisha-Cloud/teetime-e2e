@@ -27,6 +27,10 @@ const picksSteps = process.argv.some((a) => a === "--grep" || a === "-g" || a.st
 const isMainRun =
   process.argv.some((a) => a.includes("@card-flow")) || (process.argv.some((a) => a.includes("main.spec")) && !picksSteps);
 if (isMainRun) process.env.TEETIME_FRESH_LOGIN ??= "1";
+// A run without a window (no --headed, --debug or --ui: e.g. CI) has nobody watching: it is a fast run by itself
+// (support/env.ts: no reading pauses, cursor or YopMail window). Decided once, in the main process.
+const watched = process.argv.some((a) => a === "--headed" || a === "--debug" || a === "--ui" || a.startsWith("--ui-")) || !!process.env.PWDEBUG;
+process.env.TEETIME_WATCHED ??= watched ? "1" : "0";
 const isAuthRun = process.env.TEETIME_AUTH_RUN === "1";
 
 // Which browser runs the tests: by this computer — Windows / Linux: Google Chrome, macOS: Safari (WebKit) — or

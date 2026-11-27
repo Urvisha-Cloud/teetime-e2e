@@ -2,6 +2,8 @@ import { expect, type Locator, type Page, type TestInfo } from "@playwright/test
 import { env } from "./env";
 import { CURSOR_GLIDE_MS } from "./cursor";
 import { ApiRecorder, unwrap } from "./network";
+import { BookingApi } from "./booking-api";
+import { BlockedError, type BaySlotState, type CalendarGrid, type CreatedBooking, type SelectedBooking, type SlotTimes } from "./booking-types";
 import {
   addDays,
   checkoutDateLabel,
@@ -14,40 +16,28 @@ import {
   parseHeaderLabel,
   slotRange,
   todayIn,
+  zonedToUtcMs,
   type LocalDate,
 } from "./time";
 
-export interface BaySlotState {
-  bayId: string;
-  bayName: string;
-  free: boolean;
-}
+// The shared types and BlockedError live in booking-types.ts; imported from here as before.
+export * from "./booking-types";
 
-/** The rendered calendar of one day, read once: every bay and, per slot index, whether that slot can be booked. */
-export interface CalendarGrid {
-  bays: { bayId: string; bayName: string }[];
-  /** free[bayId][slot]; a slot that is not rendered is missing (not free). */
-  free: Record<string, boolean[]>;
-}
+/**
+ * The one style class the tests still read: the calendar marks the user's OWN booking only by its green outline
+ * (booking-ui CalenderGrid getBookingStyles: "before:border-green-600"; other people's bookings are gray). Only the
+ * first slot of a booking has text, so there is nothing else on every slot to check. Kept here, in one place; a data
+ * attribute on the slot in booking-ui (e.g. data-own-booking) would replace it.
+ */
+const OWN_BOOKING_STYLE = /before:border-green-600/;
 
-export interface SelectedBooking {
-  locationName: string;
-  bayId: string;
-  bayName: string;
-  date: LocalDate;
-  startIdx: number;
-  endIdx: number;
-  startTime: string; // "8:00 PM"
-  endTime: string; // "9:00 PM"
+/**
+ * The big duration value of the extend / switch-bay picker (ExtendBookingModal DurationPicker: "+45 min", "1 hr"),
+ * found by the caption right under it ("additional time" / "session length"), not by its font size.
+ */
+export function durationValue(popup: Locator, caption: "additional time" | "session length"): Locator {
+  return popup.getByText(caption, { exact: true }).locator("xpath=preceding-sibling::*[1]");
 }
-
-export interface CreatedBooking extends SelectedBooking {
-  bookingId: string;
-  groupSize: number;
-}
-
-/** Thrown when the scenario cannot be executed because staging data does not allow it (not a product failure). */
-export class BlockedError extends Error {}
 
 /** Pages whose booking calendar was just loaded by the login step and not touched since (see markCalendarFresh). */
 const freshCalendar = new WeakSet<Page>();
@@ -73,7 +63,7 @@ export function markCalendarFresh(page: Page) {
  * Selectors are taken from the shipped source: data-slot / data-screen grid attributes, accessible
  * roles/names, and visible copy. The app has no data-testid attributes.
  */
-export class BookingApp {
+export class BookingApp extends BookingApi {
   readonly api: ApiRecorder;
   readonly tz = env.browserTz;
   /**
@@ -82,7 +72,8 @@ export class BookingApp {
    */
   watch = false;
 
-  constructor(readonly page: Page) {
+  constructor(page: Page) {
+    super(page);
     this.api = new ApiRecorder(page);
   }
 
@@ -143,40 +134,6 @@ export class BookingApp {
       return;
     }
     await this.open();
-  }
-
-  /**
-   * fetch() inside the page with the signed-in user's session, the way the app's axios interceptor sends it:
-   * `Authorization: Bearer <authToken cookie>` plus `x-custom-access-id` = the user id in the JWT (the API's auth
-   * middleware requires both). Runs in the page, so the token is never logged or written anywhere.
-   */
-  private async authedFetch(
-    url: string,
-    { method = "GET", body }: { method?: string; body?: unknown } = {},
-  ): Promise<{ ok: boolean; status: number; body: any }> {
-    if (!this.page.url().startsWith(env.baseURL)) await this.page.goto("/book-now");
-    return this.page.evaluate(
-      async ({ url, method, body }) => {
-        const m = document.cookie.match(/(?:^|; )authToken=([^;]+)/);
-        let token = m ? decodeURIComponent(m[1]) : localStorage.getItem("authToken") ?? "";
-        try {
-          token = JSON.parse(token);
-        } catch {
-          /* plain string */
-        }
-        let userId = "";
-        try {
-          userId = JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))).id ?? "";
-        } catch {
-          /* leave empty; the API answers 401 and the caller's status check shows it */
-        }
-        const headers: Record<string, string> = { Authorization: `Bearer ${token}`, "x-custom-access-id": userId };
-        if (body !== undefined) headers["Content-Type"] = "application/json";
-        const res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
-        return { ok: res.ok, status: res.status, body: await res.json().catch(() => null) };
-      },
-      { url, method, body },
-    );
   }
 
   /** GET /location/get-location-with-bays (the same list the app uses). */
@@ -353,9 +310,9 @@ export class BookingApp {
   // ───────────────────────────── date navigation ─────────────────────────────
 
   private dateNav(): Locator {
-    // Innermost header block that contains the date <h2> and the prev/next chevrons.
+    // Innermost block that holds the date <h2> and the prev/next chevron buttons (lucide icons), whatever its styling
     return this.page
-      .locator("div.flex.items-center")
+      .locator("div")
       .filter({ has: this.page.locator("h2") })
       .filter({ has: this.page.locator("svg.lucide-chevron-left") })
       .last();
@@ -400,24 +357,37 @@ export class BookingApp {
    */
   async readGrid(): Promise<CalendarGrid> {
     await expect(this.page.locator('[data-slot="0"]').first()).toBeAttached();
-    return this.page.evaluate(() => {
-      const firstRow = Array.from(document.querySelectorAll<HTMLElement>('[data-slot="0"]'));
-      const ids = firstRow.map((c) => c.getAttribute("data-screen")!);
-      const header = firstRow[0]?.closest(".min-w-max")?.firstElementChild;
-      const names = header
-        ? Array.from(header.querySelectorAll<HTMLElement>("span.whitespace-nowrap")).map((s) => s.innerText.trim())
-        : [];
+    // Bay names from the app's own location data (GET /location/get-location-with-bays), by the column's bay id
+    await expect
+      .poll(() => this.api.location(env.locationName)?.bays?.length ?? 0, { message: `the bays of ${env.locationName} from the API` })
+      .toBeGreaterThan(0);
+    const names = new Map((this.api.location(env.locationName)?.bays ?? []).map((b) => [b.id, b.name]));
+    const { ids, free } = await this.page.evaluate(() => {
+      const ids = Array.from(document.querySelectorAll<HTMLElement>('[data-slot="0"]')).map((c) => c.getAttribute("data-screen")!);
       const free: Record<string, boolean[]> = Object.fromEntries(ids.map((id) => [id, [] as boolean[]]));
       for (const cell of Array.from(document.querySelectorAll<HTMLElement>("[data-screen][data-slot]"))) {
         const slots = free[cell.getAttribute("data-screen")!];
         const s = Number(cell.getAttribute("data-slot"));
         if (!slots || slots[s] !== undefined) continue; // the first cell of a slot counts (as document.querySelector)
-        const cls = cell.className ?? "";
-        // CalenderGrid gives "hover:bg-gray-100 cursor-pointer" ONLY to slots that are free, in the future
-        // and on an active bay. Booked slots get "cursor-not-allowed"/booking styles, past slots "bg-black/5".
-        slots[s] = cls.includes("hover:bg-gray-100") && !cls.includes("cursor-not-allowed") && !cls.includes("before:content");
+        // The same rule as slotIsFree (below): clickable and showing no booking
+        const before = getComputedStyle(cell, "::before").content;
+        slots[s] = getComputedStyle(cell).cursor === "pointer" && (before === "none" || before === "normal");
       }
-      return { bays: ids.map((bayId, i) => ({ bayId, bayName: names[i] ?? `bay#${i + 1}` })), free };
+      return { ids, free };
+    });
+    return { bays: ids.map((bayId, i) => ({ bayId, bayName: names.get(bayId) ?? `bay#${i + 1}` })), free };
+  }
+
+  /**
+   * A slot you can book: the app makes it clickable (cursor: pointer; past slots, other people's bookings and
+   * inactive bays are "not-allowed") and draws no booking over it (a booking is a ::before layer). Read from the
+   * computed style, not from class names, so a new color or Tailwind class does not change the answer. The user's own
+   * booking is clickable too, but has the ::before layer.
+   */
+  async slotIsFree(bayId: string, slotIdx: number): Promise<boolean> {
+    return this.cell(bayId, slotIdx).first().evaluate((cell) => {
+      const before = getComputedStyle(cell, "::before").content;
+      return getComputedStyle(cell).cursor === "pointer" && (before === "none" || before === "normal");
     });
   }
 
@@ -465,12 +435,13 @@ export class BookingApp {
    */
   async findAvailableBay(
     date: LocalDate,
+    times: SlotTimes,
     excludeBayIds: string[] = [],
     alsoFree?: { startIdx: number; endIdx: number },
     /** The day's calendar read once with readGrid() (a search over many start times); without it the page is read. */
     grid?: CalendarGrid,
   ): Promise<BaySlotState> {
-    const { startIdx, endIdx } = slotRange(env.slotStart, env.slotEnd);
+    const { startIdx, endIdx } = slotRange(times.startTime, times.endTime);
     const bays = await this.baysForRange(startIdx, endIdx, grid);
     // alsoFree: the same bay must also be free for this range (e.g. the later reschedule + extend time)
     const extra = alsoFree ? await this.baysForRange(alsoFree.startIdx, alsoFree.endIdx, grid) : null;
@@ -479,7 +450,7 @@ export class BookingApp {
         b.free &&
         !excludeBayIds.includes(b.bayId) &&
         (!extra || extra.find((x) => x.bayId === b.bayId)?.free) &&
-        this.serverConflicts(b.bayId, date, env.slotStart, env.slotEnd).length === 0 &&
+        this.serverConflicts(b.bayId, date, times.startTime, times.endTime).length === 0 &&
         // The extra range against the app's booking list too: the grid of a day does not show the part after
         // midnight of a booking that started the evening before, but the app refuses to book over it
         (!alsoFree || this.slotConflicts(b.bayId, date, alsoFree.startIdx, alsoFree.endIdx).length === 0),
@@ -492,7 +463,7 @@ export class BookingApp {
       const time = (idx: number) => (idx >= 96 ? "12:00 AM" : fromMinutes(idx * 15));
       const alsoText = alsoFree ? ` together with ${time(alsoFree.startIdx)}–${time(alsoFree.endIdx + 1)}` : "";
       throw new BlockedError(
-        `BLOCKED: ${env.slotStart}–${env.slotEnd}${alsoText} on ${isoDate(date)} is unavailable in every bay at ` +
+        `BLOCKED: ${times.startTime}–${times.endTime}${alsoText} on ${isoDate(date)} is unavailable in every bay at ` +
           `${env.locationName} (${bays.map(state).join(", ")}).`,
       );
     }
@@ -584,14 +555,21 @@ export class BookingApp {
     await this.cell(bayId, startIdx).scrollIntoViewIfNeeded();
     await this.guidedClick(this.cell(bayId, startIdx), { position: { x: 12, y: 12 } });
     await this.guidedClick(this.cell(bayId, endIdx), { position: { x: 12, y: 12 } });
-    for (let s = startIdx; s <= endIdx; s++) {
-      await expect(this.cell(bayId, s)).toHaveClass(/bg-green-400\/50/);
-    }
+    await this.expectSelection(bayId, startIdx, endIdx);
   }
 
-  /** Select the booking time in use (env.slotStart–slotEnd, found by selectRequestedSlot) in `bay`. */
-  async selectRange(bay: BaySlotState, date: LocalDate): Promise<SelectedBooking> {
-    const { startIdx, endIdx } = slotRange(env.slotStart, env.slotEnd);
+  /**
+   * The calendar shows slots startIdx..endIdx of a bay as the current selection: the app writes its time range
+   * ("8:00 PM – 9:00 PM", with the minutes) into the selection.
+   */
+  async expectSelection(bayId: string, startIdx: number, endIdx: number) {
+    const label = `${fromMinutes(startIdx * 15)} – ${fromMinutes((endIdx + 1) * 15)}`;
+    await expect(this.page.locator(`[data-screen="${bayId}"]`).getByText(label).first(), `the selection ${label}`).toBeVisible();
+  }
+
+  /** Select `times` (found by selectRequestedSlot) in `bay`. */
+  async selectRange(bay: BaySlotState, date: LocalDate, times: SlotTimes): Promise<SelectedBooking> {
+    const { startIdx, endIdx } = slotRange(times.startTime, times.endTime);
     await this.selectSlots(bay.bayId, startIdx, endIdx);
     return {
       locationName: env.locationName,
@@ -600,8 +578,8 @@ export class BookingApp {
       date,
       startIdx,
       endIdx,
-      startTime: env.slotStart,
-      endTime: env.slotEnd,
+      startTime: times.startTime,
+      endTime: times.endTime,
     };
   }
 
@@ -657,11 +635,8 @@ export class BookingApp {
   }
 
   async verifyGroupSize(modal: Locator, n: number) {
-    await expect(this.groupSizeButton(modal, n)).toHaveClass(/bg-green-600/);
-    for (const other of [1, 2, 3, 4, 5].filter((x) => x !== n)) {
-      await expect(this.groupSizeButton(modal, other)).not.toHaveClass(/bg-green-600/);
-    }
-    // PricingWaterfall subtitle + capacity note
+    // The group size buttons mark the chosen one only by color; the price says it in words: PricingWaterfall
+    // subtitle "Includes N person(s)" + capacity note
     await expect(modal).toContainText(new RegExp(`Includes (discounts and )?${n} person${n > 1 ? "s" : ""}`));
     await expect(modal).toContainText(n <= 3 ? "Max 3 persons allowed per bay" : "Max 5 persons allowed per bay");
   }
@@ -827,7 +802,7 @@ export class BookingApp {
     await this.cell(bayId, startIdx).scrollIntoViewIfNeeded();
     for (let s = startIdx; s <= endIdx; s++) {
       if (keep && s >= keep.startIdx && s <= keep.endIdx) continue;
-      await expect(this.cell(bayId, s)).not.toHaveClass(/before:border-green-600/);
+      await expect(this.cell(bayId, s)).not.toHaveClass(OWN_BOOKING_STYLE);
     }
   }
 
@@ -843,103 +818,12 @@ export class BookingApp {
     expect(fromApi.bayId).toBe(created.bayId);
     if (fromApi.numberOfPersons != null) expect(Number(fromApi.numberOfPersons)).toBe(created.groupSize);
 
-    // UI: the user's own booking is rendered with the green "own booking" style across the whole range.
+    // UI: the user's own booking covers the whole range: no slot of it is free, and each shows the own-booking outline.
     for (let s = created.startIdx; s <= created.endIdx; s++) {
-      await expect(this.cell(created.bayId, s)).toHaveClass(/before:border-green-600/);
-      await expect(this.cell(created.bayId, s)).not.toHaveClass(/hover:bg-gray-100/);
+      await expect(this.cell(created.bayId, s)).toHaveClass(OWN_BOOKING_STYLE);
+      await expect.poll(() => this.slotIsFree(created.bayId, s), { message: `${fromMinutes(s * 15)} is booked` }).toBe(false);
     }
   }
-  async walletBalance(): Promise<number> {
-    const { status, body } = await this.authedFetch(`${env.apiURL}/wallet/balance`);
-    expect(status, "GET /wallet/balance").toBe(200);
-    return Number(unwrap<any>(body)?.balance ?? 0);
-  }
 
-
-  async membership(): Promise<any | null> {
-    const { status, body } = await this.authedFetch(`${env.apiURL}/membership/me`);
-    expect(status, "GET /membership/me").toBe(200);
-    const data = unwrap<any>(body);
-    return data && typeof data === "object" && data.status ? data : null;
-  }
-
-  /** A gift card as the app checks it (GET /giftCode/validate/:code): what is left on it, or why it cannot be used. */
-  async giftCard(code: string): Promise<{ valid: boolean; balance: number; message: string }> {
-    const { status, body } = await this.authedFetch(`${env.apiURL}/giftCode/validate/${encodeURIComponent(code)}`);
-    expect(status, "GET /giftCode/validate").toBe(200);
-    const balance = body?.isValid ? Math.round((Number(body.data.amount) - Number(body.data.usedAmount)) * 100) / 100 : 0;
-    return { valid: body?.isValid === true, balance, message: String(body?.message ?? "") };
-  }
-
-  /** What is left on a gift card that was already used in this run; 0 when it is used up. */
-  async giftCardBalance(code: string): Promise<number> {
-    const { valid, balance, message } = await this.giftCard(code);
-    if (!valid) expect(message, "a gift card without a balance is used up").toMatch(/exhausted/i);
-    return balance;
-  }
-
-  /** The wallet's transaction history, newest first (GET /wallet/transactions). */
-  async walletTransactions(): Promise<any[]> {
-    const { status, body } = await this.authedFetch(`${env.apiURL}/wallet/transactions`);
-    expect(status, "GET /wallet/transactions").toBe(200);
-    const list = unwrap<any>(body)?.transactions;
-    return Array.isArray(list) ? list : [];
-  }
-
-  async fetchBooking(bookingId: string): Promise<any> {
-    const { status, body } = await this.authedFetch(`${env.apiURL}/booking/${bookingId}`);
-    expect(status, `GET /booking/${bookingId}`).toBe(200);
-    return unwrap<any>(body);
-  }
-
-  // ───────────────────────────── cleanup ─────────────────────────────
-
-  /**
-   * Opt-in (TEETIME_CLEANUP=true): cancel through the app's own endpoint used by the Cancel flow
-   * (useCancelBookingMutation -> PATCH /booking/cancel/:id?wantRefund=true). Runs in the page so the
-   * app's session is used; the token is never logged or written anywhere.
-   */
-  async cancelBooking(bookingId: string): Promise<{ ok: boolean; status: number }> {
-    const { ok, status } = await this.authedFetch(`${env.apiURL}/booking/cancel/${bookingId}?wantRefund=true`, {
-      method: "PATCH",
-      body: { refundType: "partial", cancelAsUser: true, cancellationReason: "Automated E2E test cleanup" },
-    });
-    return { ok, status };
-  }
-
-  /**
-   * Ids of the logged-in user's ACTIVE (not cancelled) bookings from yesterday to 4 days ahead, via the app's
-   * own endpoint GET /booking/getMyBookings (it only returns active bookings). Used by negative tests to prove
-   * that a failed payment left no booking behind.
-   */
-  async myActiveBookingIds(): Promise<string[]> {
-    const now = Date.now();
-    const start = new Date(now - 24 * 3600e3).toISOString();
-    const end = new Date(now + 4 * 24 * 3600e3).toISOString();
-    const result = await this.authedFetch(`${env.apiURL}/booking/getMyBookings?startDate=${start}&endDate=${end}`);
-    expect(result.status, "GET /booking/getMyBookings").toBe(200);
-    const list = unwrap<any[]>(result.body) ?? [];
-    return (Array.isArray(list) ? list : []).filter((b) => !b.isCancelled).map((b) => String(b.id));
-  }
 }
 
-/** Local wall-clock (date + minutes after midnight) in `tz` -> UTC epoch ms. */
-function zonedToUtcMs(date: LocalDate, minutes: number, tz: string): number {
-  const guess = Date.UTC(date.year, date.month - 1, date.day, 0, minutes);
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: tz,
-    hourCycle: "h23",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).formatToParts(new Date(guess));
-  const get = (t: string) => Number(parts.find((p) => p.type === t)!.value);
-  const asIfUtc = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"));
-  return guess - (asIfUtc - guess);
-}
-
-export function annotateBlocked(testInfo: TestInfo, reason: string) {
-  testInfo.annotations.push({ type: "blocked", description: reason });
-}
